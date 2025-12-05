@@ -23,10 +23,10 @@
 </script>
 
 <main>
-  <div 
-    bind:this={container} 
+  <div
+    bind:this={container}
     class="game-container"
-  />
+  ></div>
   <div class="controls">
     <p>Use Arrow Keys or WASD to control the car</p>
     <p>Press SPACE to shoot rockets</p>
