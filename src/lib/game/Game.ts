@@ -195,13 +195,9 @@ export class Game {
       
       // Handle space key press for firing rockets
       if (event.code === 'Space') {
-        const carPos = this.playerCar.getCar().position;
         const rocket = this.playerCar.fireRocket();
-        // Set rocket initial height to match terrain
-        const rocketMesh = rocket.getRocket();
-        const groundHeight = this.worldGenerator.getHeightAt(carPos.x, carPos.z);
-        rocketMesh.position.y = groundHeight + 1; // Slightly above ground
-        this.scene.add(rocketMesh);
+        // Rocket position is already set by fireRocket() from cannon position
+        this.scene.add(rocket.getRocket());
       }
 
       // Update car controls based on current key states
@@ -479,17 +475,10 @@ export class Game {
 
     for (let i = allRockets.length - 1; i >= 0; i--) {
       const rocket = allRockets[i];
-      
+
       // Update rocket first
       rocket.update(deltaTime);
-      
-      // Keep rocket at proper height
-      if (!rocket.hasExploded()) {
-        const rocketPos = rocket.getPosition();
-        const groundHeight = this.worldGenerator.getHeightAt(rocketPos.x, rocketPos.z);
-        rocketPos.y = groundHeight + 1; // Keep rocket slightly above ground
-      }
-      
+
       // If rocket is dead, clean it up and continue
       if (!rocket.isAlive()) {
         const rocketExplosion = rocket.getExplosion();
@@ -503,7 +492,20 @@ export class Game {
 
       // Only check collisions if rocket hasn't exploded yet
       if (!rocket.hasExploded()) {
-        // Check environment collisions
+        const rocketPos = rocket.getPosition();
+        const groundHeight = this.worldGenerator.getHeightAt(rocketPos.x, rocketPos.z);
+
+        // Check if rocket hit the ground
+        if (rocketPos.y <= groundHeight + 0.2) {
+          rocket.explode();
+          const rocketExplosion = rocket.getExplosion();
+          if (rocketExplosion) {
+            this.scene.add(rocketExplosion.getExplosion());
+          }
+          continue;
+        }
+
+        // Check environment collisions (trees, etc)
         const collision = this.track.checkRocketCollision(rocket.getPosition());
         if (collision.object) {
           rocket.explode();
