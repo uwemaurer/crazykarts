@@ -35,9 +35,9 @@ export class Car {
   private readonly DECELERATION = 10; // Added deceleration rate
   private readonly MAX_SPEED = 40; // Keep max speed
   private readonly MAX_REVERSE_SPEED = -20; // Keep max reverse speed
-  private readonly MAX_STEERING_ANGLE = Math.PI / 3; // 60 degrees max steering (was 45)
-  private readonly STEERING_SPEED = 3.0; // Faster wheel turning (was 2.0)
-  private readonly TURN_RESPONSE = 3.5; // More responsive turning (was 2.0)
+  private readonly MAX_STEERING_ANGLE = Math.PI / 4; // 45 degrees max steering
+  private readonly STEERING_SPEED = 10.0; // Very fast wheel turning for immediate response
+  private readonly TURN_RESPONSE = 2.5; // Direct turning response
   private debris: THREE.Group | null;
   private destroyed: boolean;
   private frontWheels: THREE.Group;
@@ -463,7 +463,10 @@ export class Car {
 
     // Apply rotation based on steering angle and speed
     if (Math.abs(this.speed) > 0.1) {
-      const turnAmount = (this.steeringAngle * this.TURN_RESPONSE * this.speed * deltaTime) / this.MAX_SPEED;
+      // More direct turning - less dependent on max speed
+      const speedFactor = Math.abs(this.speed) / 10; // Normalize to reasonable range
+      const baseTurnRate = this.steeringAngle * this.TURN_RESPONSE * deltaTime;
+      const turnAmount = baseTurnRate * Math.min(speedFactor, 1.5); // Cap the speed influence
       this.car.rotation.y += turnAmount;
     }
   }

@@ -3,6 +3,8 @@ import { RaceTrack } from './RaceTrack';
 import { Car } from './Car';
 import { Rocket } from './Rocket';
 import { Explosion } from './Explosion';
+import { Zombie } from './Zombie';
+import { Slime } from './Slime';
 import * as TPane from 'tweakpane';
 import { WorldGenerator } from './WorldGenerator';
 import type { WorldChunk } from './WorldGenerator';
@@ -15,6 +17,8 @@ export class Game {
   private playerCar: Car = new Car(0xff0000, new THREE.Vector3(0, 0, 15));
   private buddies: Car[] = [];
   private opponents: Car[] = [];
+  private zombies: Zombie[] = [];
+  private slimes: Slime[] = [];
   private clock: THREE.Clock;
   private keyStates: { [key: string]: boolean } = {};
   private titleElement: HTMLDivElement | null = null;
@@ -48,9 +52,9 @@ export class Game {
   };
 
   // Game constants
-  private static readonly MAX_SPEED = 40;
-  private static readonly MAX_REVERSE_SPEED = -20;
-  private static readonly TURN_SPEED = 3;
+  private static readonly MAX_SPEED = 25; // Reduced from 40 for better control
+  private static readonly MAX_REVERSE_SPEED = -15; // Reduced from -20
+  private static readonly TURN_SPEED = 1; // Normalized turn input (will be multiplied by steering angle)
 
   private worldGenerator: WorldGenerator;
   private chunks: Map<string, WorldChunk>;
@@ -166,30 +170,19 @@ export class Game {
     this.playerCar = new Car(0xff0000, new THREE.Vector3(0, 0, 0));
     this.scene.add(this.playerCar.getCar());
 
-    // Add buddy cars
-    const buddyPositions = [
-      new THREE.Vector3(-3, 0, 3),  // Left buddy
-      new THREE.Vector3(3, 0, 3),   // Right buddy
-    ];
+    // Buddies and opponents removed - only player and zombies now
 
-    buddyPositions.forEach((position) => {
-      const buddy = new Car(0x00ff00, position); // Green color for buddies
-      this.buddies.push(buddy);
-      this.scene.add(buddy.getCar());
-    });
-
-    // Create opponents within track boundaries
-    const opponentPositions = [
-      new THREE.Vector3(-8, 0, 5),  // Left side of track
-      new THREE.Vector3(8, 0, 5),   // Right side of track
-      new THREE.Vector3(0, 0, -5)   // Center of track
-    ];
-
-    opponentPositions.forEach((position) => {
-      const opponent = new Car(0x0000ff, position);
-      this.opponents.push(opponent);
-      this.scene.add(opponent.getCar());
-    });
+    // Spawn zombies around the world
+    const zombieCount = 10;
+    for (let i = 0; i < zombieCount; i++) {
+      const angle = (i / zombieCount) * Math.PI * 2;
+      const radius = 15 + Math.random() * 20;
+      const x = Math.cos(angle) * radius;
+      const z = Math.sin(angle) * radius;
+      const zombie = new Zombie(new THREE.Vector3(x, 0, z));
+      this.zombies.push(zombie);
+      this.scene.add(zombie.getZombie());
+    }
 
     // Initial camera position
     this.camera.position.set(0, 5, 30);
@@ -275,98 +268,6 @@ export class Game {
   private isOnTrack(position: THREE.Vector3): boolean {
     return Math.abs(position.x) < Game.TRACK_AREA.halfWidth &&
            Math.abs(position.z) < Game.TRACK_AREA.halfLength;
-  }
-
-  private updateOpponents(deltaTime: number, allCars: Car[]) {
-    this.opponents.forEach(opponent => {
-      // Clean up opponent explosions and debris if they exist
-      const explosion = opponent.getExplosion();
-      if (explosion && !explosion.isAlive()) {
-        this.scene.remove(explosion.getExplosion());
-        this.scene.remove(explosion.getDebris());
-      }
-
-      if (!opponent.isDestroyed()) {
-        const opponentPos = opponent.getCar().position;
-        const playerPos = this.playerCar.getCar().position;
-        
-        // Check if opponent is near world boundaries or on track
-        const nearBoundary = 
-          opponentPos.z > Game.OPPONENT_BOUNDS.front ||
-          opponentPos.z < Game.OPPONENT_BOUNDS.back ||
-          opponentPos.x > Game.OPPONENT_BOUNDS.right ||
-          opponentPos.x < Game.OPPONENT_BOUNDS.left;
-
-        const onTrack = this.isOnTrack(opponentPos);
-        const needsToTurn = nearBoundary || onTrack;
-
-        // Calculate distance and direction to player
-        const distanceToPlayer = opponentPos.distanceTo(playerPos);
-        const directionToPlayer = new THREE.Vector3().subVectors(playerPos, opponentPos).normalize();
-        
-        // Get opponent's forward direction
-        const forward = new THREE.Vector3(0, 0, -1);
-        forward.applyQuaternion(opponent.getCar().quaternion);
-
-        // Check if the opponent is stuck
-        if (opponent.isStuck()) {
-          // Let the Car class handle the unstuck behavior
-          return;
-        }
-
-        if (needsToTurn) {
-          if (onTrack) {
-            // Get off the track quickly
-            const escapeDirection = new THREE.Vector3(
-              Math.sign(opponentPos.x) || (Math.random() < 0.5 ? 1 : -1),
-              0,
-              Math.sign(opponentPos.z) || (Math.random() < 0.5 ? 1 : -1)
-            );
-            const escapeAngle = Math.atan2(escapeDirection.x, escapeDirection.z);
-            const currentAngle = opponent.getCar().rotation.y;
-            const turnDirection = Math.sign(escapeAngle - currentAngle);
-            
-            opponent.setSpeed(10); // Move at moderate speed
-            opponent.setTurnSpeed(turnDirection * 3); // Turn sharply
-          } else {
-            // Near world boundary, turn gradually
-            opponent.setSpeed(opponent.getSpeed() * 0.8);
-            opponent.setTurnSpeed((Math.random() - 0.5) * 3);
-          }
-        } else if (distanceToPlayer < 20) {
-          // Calculate if the evasion path would cross the track
-          const futurePos = opponentPos.clone().add(
-            directionToPlayer.clone().multiplyScalar(5)
-          );
-          
-          if (!this.isOnTrack(futurePos)) {
-            // Safe to evade
-            opponent.setSpeed(12);
-            const evasionDirection = Math.sign(opponentPos.x - playerPos.x);
-            opponent.setTurnSpeed(evasionDirection * 2);
-          } else {
-            // Would cross track, move parallel to it instead
-            const parallelDirection = Math.sign(opponentPos.z - playerPos.z);
-            opponent.setTurnSpeed(parallelDirection * 1.5);
-            opponent.setSpeed(10);
-          }
-        } else {
-          // Normal cruising on green area
-          const cruisingSpeed = 8 + Math.random() * 4;
-          opponent.setSpeed(cruisingSpeed);
-          
-          // Gentle turns that tend to run parallel to the track
-          const preferredAngle = Math.abs(opponentPos.x) > Game.TRACK_AREA.halfWidth * 1.5 ?
-            Math.sign(opponentPos.z) * Math.PI / 2 : // Move parallel to track when far from it
-            Math.sign(opponentPos.x) * Math.PI; // Move away from track when closer
-            
-          const angleDiff = (preferredAngle - opponent.getCar().rotation.y) % (Math.PI * 2);
-          opponent.setTurnSpeed(Math.sign(angleDiff) * 1);
-        }
-      }
-      
-      opponent.update(deltaTime, allCars);
-    });
   }
 
   private setupDebugPane() {
@@ -548,76 +449,6 @@ export class Game {
     return `${x},${z}`;
   }
 
-  private updateBuddies(deltaTime: number, allCars: Car[]) {
-    const playerPos = this.playerCar.getCar().position;
-    const playerRotation = this.playerCar.getCar().rotation.y;
-    const playerSpeed = this.playerCar.getSpeed();
-    const playerForward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), playerRotation);
-
-    this.buddies.forEach((buddy, index) => {
-      // Calculate desired formation position relative to player
-      const sideOffset = index === 0 ? -5 : 5; // Wider spacing
-      const backOffset = -3; // Slightly behind player
-      
-      // Calculate desired position in world space
-      const desiredPos = playerPos.clone()
-        .add(new THREE.Vector3(
-          playerForward.x * backOffset - playerForward.z * sideOffset,
-          0,
-          playerForward.z * backOffset + playerForward.x * sideOffset
-        ));
-
-      // Calculate direction and distance to desired position
-      const buddyPos = buddy.getCar().position;
-      const direction = desiredPos.clone().sub(buddyPos);
-      const distance = direction.length();
-
-      // Match player's shooting with slight delay for each buddy
-      if (this.keyStates['Space']) {
-        setTimeout(() => {
-          const rocket = buddy.fireRocket();
-          const rocketMesh = rocket.getRocket();
-          const groundHeight = this.worldGenerator.getHeightAt(buddyPos.x, buddyPos.z);
-          rocketMesh.position.y = groundHeight + 1;
-          this.scene.add(rocketMesh);
-        }, index * 100); // 100ms delay between buddy shots
-      }
-
-      // Adjust speed and turning based on position relative to player
-      if (distance > 0.5) {
-        // Calculate target angle to desired position
-        const targetAngle = Math.atan2(direction.x, direction.z);
-        const currentAngle = buddy.getCar().rotation.y;
-        let angleDiff = (targetAngle - currentAngle + Math.PI * 3) % (Math.PI * 2) - Math.PI;
-
-        // Smoother turning
-        const turnSpeed = Math.sign(angleDiff) * Math.min(Math.abs(angleDiff * 2), Game.TURN_SPEED);
-        
-        // Adjust speed based on distance and angle
-        const speedFactor = Math.cos(angleDiff); // Reduce speed when turning sharply
-        const targetSpeed = Math.min(
-          distance * 8, // Faster catch-up
-          Math.max(playerSpeed * speedFactor, Game.MAX_SPEED)
-        );
-
-        buddy.setTurnSpeed(turnSpeed);
-        buddy.setSpeed(targetSpeed);
-      } else {
-        // When in position, match player's rotation and speed
-        buddy.getCar().rotation.y = playerRotation;
-        buddy.setSpeed(playerSpeed);
-        buddy.setTurnSpeed(0);
-      }
-
-      // Update buddy physics
-      buddy.update(deltaTime, allCars);
-
-      // Keep buddy on ground
-      const groundHeight = this.worldGenerator.getHeightAt(buddyPos.x, buddyPos.z);
-      buddyPos.y = groundHeight + 0.5;
-    });
-  }
-
   public animate() {
     const deltaTime = this.clock.getDelta();
     
@@ -635,25 +466,16 @@ export class Game {
     // Update title if it exists
     this.updateTitle();
 
-    // Get all cars for collision checking
-    const allCars = [this.playerCar, ...this.buddies, ...this.opponents];
-
-    // Update player car with collision checking
-    this.playerCar.update(deltaTime, allCars);
+    // Update player car (no other cars to collide with)
+    this.playerCar.update(deltaTime, []);
 
     // Keep car on ground
     const carPos = this.playerCar.getCar().position;
     const groundHeight = this.worldGenerator.getHeightAt(carPos.x, carPos.z);
     carPos.y = groundHeight + 0.5;
 
-    // Update buddies
-    this.updateBuddies(deltaTime, allCars);
-
     // Update rockets and check collisions
-    const allRockets = [
-      ...this.playerCar.getRockets(),
-      ...this.buddies.flatMap(buddy => buddy.getRockets())
-    ];
+    const allRockets = this.playerCar.getRockets();
 
     for (let i = allRockets.length - 1; i >= 0; i--) {
       const rocket = allRockets[i];
@@ -681,130 +503,107 @@ export class Game {
 
       // Only check collisions if rocket hasn't exploded yet
       if (!rocket.hasExploded()) {
-        // Check collisions with opponent cars
-        let hasCollided = false;
-        for (const opponent of this.opponents) {
-          if (!opponent.isDestroyed() && rocket.checkCollision(opponent)) {
-            hasCollided = true;
-            
-            // Create rocket explosion first
-            rocket.explode();
-            const rocketExplosion = rocket.getExplosion();
-            if (rocketExplosion) {
-              this.scene.add(rocketExplosion.getExplosion());
-            }
-
-            // Then handle opponent destruction
-            opponent.destroy();
-            const opponentExplosion = opponent.getExplosion();
-            if (opponentExplosion) {
-              this.scene.add(opponentExplosion.getExplosion());
-            }
-            break;
+        // Check environment collisions
+        const collision = this.track.checkRocketCollision(rocket.getPosition());
+        if (collision.object) {
+          rocket.explode();
+          if (collision.type === 'tree') {
+            this.track.setTreeOnFire(collision.object as THREE.Group);
           }
-        }
-
-        // Only check environment collisions if no car collision occurred
-        if (!hasCollided) {
-          const collision = this.track.checkRocketCollision(rocket.getPosition());
-          if (collision.object) {
-            rocket.explode();
-            if (collision.type === 'tree') {
-              this.track.setTreeOnFire(collision.object as THREE.Group);
-            }
-            const rocketExplosion = rocket.getExplosion();
-            if (rocketExplosion) {
-              this.scene.add(rocketExplosion.getExplosion());
-            }
+          const rocketExplosion = rocket.getExplosion();
+          if (rocketExplosion) {
+            this.scene.add(rocketExplosion.getExplosion());
           }
         }
       }
     }
 
-    // Update and cleanup opponents
-    for (let i = this.opponents.length - 1; i >= 0; i--) {
-      const opponent = this.opponents[i];
-      
-      if (opponent.isDestroyed()) {
-        const explosion = opponent.getExplosion();
-        if (explosion && explosion.isAlive()) {
-          explosion.update(deltaTime);
-        } else if (explosion) {
-          // If explosion is done, remove everything
-          this.scene.remove(opponent.getCar());
-          this.scene.remove(explosion.getExplosion());
-          const debris = opponent.getDebris();
-          if (debris) {
-            this.scene.remove(debris);
-          }
-          // Remove the opponent from the array
-          this.opponents.splice(i, 1);
-          
-          // Create a new opponent at a random position
-          const angle = Math.random() * Math.PI * 2;
-          const radius = 30 + Math.random() * 10; // Random distance from center
-          const x = Math.cos(angle) * radius;
-          const z = Math.sin(angle) * radius;
-          const newOpponent = new Car(0x0000ff, new THREE.Vector3(x, 0, z));
-          this.opponents.push(newOpponent);
-          this.scene.add(newOpponent.getCar());
-        }
-      } else {
-        // Update opponent behavior
-        const opponentPos = opponent.getCar().position;
-        const playerPos = this.playerCar.getCar().position;
-        
-        // Check if opponent is near world boundaries or on track
-        const nearBoundary = 
-          opponentPos.z > Game.OPPONENT_BOUNDS.front ||
-          opponentPos.z < Game.OPPONENT_BOUNDS.back ||
-          opponentPos.x > Game.OPPONENT_BOUNDS.right ||
-          opponentPos.x < Game.OPPONENT_BOUNDS.left;
+    // Update zombies
+    const playerPos = this.playerCar.getCar().position;
+    for (let i = this.zombies.length - 1; i >= 0; i--) {
+      const zombie = this.zombies[i];
 
-        const onTrack = this.isOnTrack(opponentPos);
-        const needsToTurn = nearBoundary || onTrack;
+      if (zombie.isDestroyed()) {
+        // Remove destroyed zombie
+        this.scene.remove(zombie.getZombie());
+        this.zombies.splice(i, 1);
 
-        // Calculate distance and direction to player
-        const distanceToPlayer = opponentPos.distanceTo(playerPos);
-        
-        if (opponent.isStuck()) {
-          // Let the Car class handle the unstuck behavior
-          opponent.update(deltaTime, allCars);
-          continue;
-        }
+        // Spawn a new zombie at a random position away from player
+        const angle = Math.random() * Math.PI * 2;
+        const radius = 30 + Math.random() * 20;
+        const x = playerPos.x + Math.cos(angle) * radius;
+        const z = playerPos.z + Math.sin(angle) * radius;
+        const newZombie = new Zombie(new THREE.Vector3(x, 0, z));
+        this.zombies.push(newZombie);
+        this.scene.add(newZombie.getZombie());
+        continue;
+      }
 
-        if (needsToTurn) {
-          if (onTrack) {
-            // Get off the track quickly
-            const escapeDirection = new THREE.Vector3(
-              Math.sign(opponentPos.x) || (Math.random() < 0.5 ? 1 : -1),
-              0,
-              Math.sign(opponentPos.z) || (Math.random() < 0.5 ? 1 : -1)
-            );
-            const escapeAngle = Math.atan2(escapeDirection.x, escapeDirection.z);
-            const currentAngle = opponent.getCar().rotation.y;
-            const turnDirection = Math.sign(escapeAngle - currentAngle);
-            
-            opponent.setSpeed(10);
-            opponent.setTurnSpeed(turnDirection * 3);
-          } else {
-            // Near world boundary, turn gradually
-            opponent.setSpeed(opponent.getSpeed() * 0.8);
-            opponent.setTurnSpeed((Math.random() - 0.5) * 3);
-          }
-        } else if (distanceToPlayer < 20) {
-          // Evade player
-          const evasionDirection = Math.sign(opponentPos.x - playerPos.x);
-          opponent.setSpeed(12);
-          opponent.setTurnSpeed(evasionDirection * 2);
+      // Update zombie to chase player (with collision avoidance from other zombies)
+      zombie.update(deltaTime, playerPos, this.zombies);
+
+      // Keep zombie on ground
+      const zombiePos = zombie.getPosition();
+      const groundHeight = this.worldGenerator.getHeightAt(zombiePos.x, zombiePos.z);
+      zombiePos.y = groundHeight;
+
+      // Check collision with player
+      if (zombie.checkCollision(playerPos, 2.5)) {
+        const playerSpeed = this.playerCar.getSpeed();
+
+        // If player is moving fast, run over the zombie
+        if (Math.abs(playerSpeed) > 10) {
+          zombie.destroy();
+
+          // Create slime effect at zombie position
+          const slime = new Slime(zombiePos.clone());
+          this.slimes.push(slime);
+          this.scene.add(slime.getSlime());
         } else {
-          // Normal cruising
-          opponent.setSpeed(8 + Math.random() * 4);
-          opponent.setTurnSpeed((Math.random() - 0.5) * 1.5);
-        }
+          // Push zombie away from player
+          const pushDirection = new THREE.Vector3().subVectors(zombiePos, playerPos);
+          pushDirection.y = 0;
+          pushDirection.normalize();
 
-        // Update physics and collisions
-        opponent.update(deltaTime, allCars);
+          // Push zombie away
+          const pushDistance = 2;
+          zombiePos.add(pushDirection.multiplyScalar(pushDistance));
+
+          // Slightly slow down player (but not too much)
+          this.playerCar.setSpeed(playerSpeed * 0.8);
+        }
+      }
+
+      // Check if zombie is hit by rockets
+      for (const rocket of allRockets) {
+        if (!rocket.hasExploded() && zombie.checkCollision(rocket.getPosition(), 1)) {
+          zombie.destroy();
+
+          // Create rocket explosion
+          rocket.explode();
+          const rocketExplosion = rocket.getExplosion();
+          if (rocketExplosion) {
+            this.scene.add(rocketExplosion.getExplosion());
+          }
+
+          // Create slime effect at zombie position
+          const slime = new Slime(zombiePos.clone());
+          this.slimes.push(slime);
+          this.scene.add(slime.getSlime());
+
+          break;
+        }
+      }
+    }
+
+    // Update and cleanup slime effects
+    for (let i = this.slimes.length - 1; i >= 0; i--) {
+      const slime = this.slimes[i];
+      slime.update(deltaTime);
+
+      if (!slime.isAlive()) {
+        this.scene.remove(slime.getSlime());
+        this.slimes.splice(i, 1);
       }
     }
 
