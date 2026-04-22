@@ -5,11 +5,17 @@ import { Rocket } from './Rocket';
 import { Explosion } from './Explosion';
 import { Zombie } from './Zombie';
 import { MegaZombie } from './MegaZombie';
+import { ZombieBase } from './ZombieBase';
 import { Slime } from './Slime';
-import { Trash } from './Trash';
 import * as TPane from 'tweakpane';
 import { WorldGenerator } from './WorldGenerator';
 import type { WorldChunk } from './WorldGenerator';
+
+function randomPointAround(origin: THREE.Vector3, minRadius: number, maxRadius: number): THREE.Vector3 {
+  const angle = Math.random() * Math.PI * 2;
+  const radius = minRadius + Math.random() * (maxRadius - minRadius);
+  return new THREE.Vector3(origin.x + Math.cos(angle) * radius, 0, origin.z + Math.sin(angle) * radius);
+}
 
 export class Game {
   private scene: THREE.Scene;
@@ -535,229 +541,91 @@ export class Game {
       }
     }
 
-    // Update zombies
     const playerPos = this.playerCar.getCar().position;
+    const allEnemies: ZombieBase[] = [...this.zombies, ...this.megaZombies];
+
     for (let i = this.zombies.length - 1; i >= 0; i--) {
       const zombie = this.zombies[i];
 
       if (zombie.isDestroyed()) {
-        // Remove destroyed zombie and all its trash
         this.scene.remove(zombie.getZombie());
-        const thrownTrash = zombie.getThrownTrash();
-        for (const trash of thrownTrash) {
+        for (const trash of zombie.getThrownTrash()) {
           this.scene.remove(trash.getTrash());
         }
         this.zombies.splice(i, 1);
-
-        // Spawn a new zombie at a random position away from player
-        const angle = Math.random() * Math.PI * 2;
-        const radius = 30 + Math.random() * 20;
-        const x = playerPos.x + Math.cos(angle) * radius;
-        const z = playerPos.z + Math.sin(angle) * radius;
-        const newZombie = new Zombie(new THREE.Vector3(x, 0, z));
-        this.zombies.push(newZombie);
-        this.scene.add(newZombie.getZombie());
+        this.zombies.push(this.spawnZombieNear(playerPos, 30, 50));
         continue;
       }
 
-      // Update zombie to chase player (with collision avoidance from other zombies)
-      zombie.update(deltaTime, playerPos, this.zombies);
+      zombie.update(deltaTime, playerPos, allEnemies);
 
-      // Keep zombie on ground
       const zombiePos = zombie.getPosition();
-      const groundHeight = this.worldGenerator.getHeightAt(zombiePos.x, zombiePos.z);
-      zombiePos.y = groundHeight;
+      zombiePos.y = this.worldGenerator.getHeightAt(zombiePos.x, zombiePos.z);
 
-      // Handle zombie's thrown trash
-      const thrownTrash = zombie.getThrownTrash();
-      for (let j = thrownTrash.length - 1; j >= 0; j--) {
-        const trash = thrownTrash[j];
+      this.updateThrownTrash(zombie, playerPos, deltaTime);
 
-        // Add newly thrown trash to scene
-        if (!trash.getTrash().parent) {
-          this.scene.add(trash.getTrash());
-        }
-
-        // Update trash
-        const trashPos = trash.getPosition();
-        const trashGroundHeight = this.worldGenerator.getHeightAt(trashPos.x, trashPos.z);
-        trash.update(deltaTime, trashGroundHeight);
-
-        // Check collision with player
-        if (trash.isAlive() && trash.checkCollision(playerPos, 1.5)) {
-          trash.destroy();
-          this.scene.remove(trash.getTrash());
-
-          // Slow down player slightly when hit by trash
-          const playerSpeed = this.playerCar.getSpeed();
-          this.playerCar.setSpeed(playerSpeed * 0.85);
-        }
-
-        // Remove dead trash
-        if (!trash.isAlive()) {
-          this.scene.remove(trash.getTrash());
-        }
-      }
-
-      // Cleanup dead trash from zombie's array
-      zombie.cleanupTrash();
-
-      // Check collision with player
       if (zombie.checkCollision(playerPos, 2.5)) {
         const playerSpeed = this.playerCar.getSpeed();
-
-        // If player is moving fast, run over the zombie
         if (Math.abs(playerSpeed) > 10) {
           zombie.destroy();
-
-          // Create slime effect at zombie position
-          const slime = new Slime(zombiePos.clone());
-          this.slimes.push(slime);
-          this.scene.add(slime.getSlime());
+          this.addSlime(zombiePos);
         } else {
-          // Push zombie away from player
           const pushDirection = new THREE.Vector3().subVectors(zombiePos, playerPos);
           pushDirection.y = 0;
-          pushDirection.normalize();
-
-          // Push zombie away
-          const pushDistance = 2;
-          zombiePos.add(pushDirection.multiplyScalar(pushDistance));
-
-          // Slightly slow down player (but not too much)
+          zombiePos.add(pushDirection.normalize().multiplyScalar(2));
           this.playerCar.setSpeed(playerSpeed * 0.8);
         }
       }
 
-      // Check if zombie is hit by rockets
-      for (const rocket of allRockets) {
-        if (!rocket.hasExploded() && zombie.checkCollision(rocket.getPosition(), 1)) {
-          zombie.destroy();
-
-          // Create rocket explosion
-          rocket.explode();
-          const rocketExplosion = rocket.getExplosion();
-          if (rocketExplosion) {
-            this.scene.add(rocketExplosion.getExplosion());
-          }
-
-          // Create slime effect at zombie position
-          const slime = new Slime(zombiePos.clone());
-          this.slimes.push(slime);
-          this.scene.add(slime.getSlime());
-
-          break;
-        }
-      }
+      this.applyRocketHits(zombie, allRockets);
     }
 
-    // Update and cleanup slime effects
     for (let i = this.slimes.length - 1; i >= 0; i--) {
       const slime = this.slimes[i];
       slime.update(deltaTime);
-
       if (!slime.isAlive()) {
         this.scene.remove(slime.getSlime());
         this.slimes.splice(i, 1);
       }
     }
 
-    // Update mega zombies
     for (let i = this.megaZombies.length - 1; i >= 0; i--) {
       const megaZombie = this.megaZombies[i];
 
       if (megaZombie.isDestroyed()) {
-        // Remove destroyed mega zombie
         this.scene.remove(megaZombie.getZombie());
         this.megaZombies.splice(i, 1);
-
-        // Spawn a new mega zombie at a random position away from player
-        const angle = Math.random() * Math.PI * 2;
-        const radius = 40 + Math.random() * 20;
-        const x = playerPos.x + Math.cos(angle) * radius;
-        const z = playerPos.z + Math.sin(angle) * radius;
-        const newMegaZombie = new MegaZombie(new THREE.Vector3(x, 0, z));
-        this.megaZombies.push(newMegaZombie);
-        this.scene.add(newMegaZombie.getZombie());
+        this.megaZombies.push(this.spawnMegaZombieNear(playerPos, 40, 60));
         continue;
       }
 
-      // Update mega zombie to chase player (with collision avoidance from all zombies)
-      const allZombies = [...this.zombies, ...this.megaZombies];
-      megaZombie.update(deltaTime, playerPos, allZombies);
+      megaZombie.update(deltaTime, playerPos, allEnemies);
 
-      // Keep mega zombie on ground
       const megaZombiePos = megaZombie.getPosition();
-      const groundHeight = this.worldGenerator.getHeightAt(megaZombiePos.x, megaZombiePos.z);
-      megaZombiePos.y = groundHeight;
+      megaZombiePos.y = this.worldGenerator.getHeightAt(megaZombiePos.x, megaZombiePos.z);
 
-      // Check collision with player
       if (megaZombie.checkCollision(playerPos, 2.5)) {
         const playerSpeed = this.playerCar.getSpeed();
-
-        // Mega zombie is harder to run over - need higher speed
         if (Math.abs(playerSpeed) > 20) {
           megaZombie.destroy();
-
-          // Create slime effect at mega zombie position
-          const slime = new Slime(megaZombiePos.clone());
-          this.slimes.push(slime);
-          this.scene.add(slime.getSlime());
+          this.addSlime(megaZombiePos);
         } else {
-          // Push player away from mega zombie (mega zombie is stronger)
           const pushDirection = new THREE.Vector3().subVectors(playerPos, megaZombiePos);
           pushDirection.y = 0;
-          pushDirection.normalize();
-
-          // Push player away
-          const pushDistance = 3;
-          playerPos.add(pushDirection.multiplyScalar(pushDistance));
-
-          // Slow down player significantly
+          playerPos.add(pushDirection.normalize().multiplyScalar(3));
           this.playerCar.setSpeed(playerSpeed * 0.6);
         }
       }
 
-      // Check if mega zombie's club hits the player during attack
       if (megaZombie.isAttackingPlayer() && megaZombie.checkCollision(playerPos, megaZombie.getAttackRange())) {
-        const playerSpeed = this.playerCar.getSpeed();
-
-        // Club hit! Knock player back and slow them down significantly
-        const knockbackDirection = new THREE.Vector3().subVectors(playerPos, megaZombiePos);
-        knockbackDirection.y = 0;
-        knockbackDirection.normalize();
-
-        // Strong knockback
-        playerPos.add(knockbackDirection.multiplyScalar(5));
-
-        // Significant speed reduction
-        this.playerCar.setSpeed(playerSpeed * 0.3);
-
-        // Mark that this attack has landed (prevents multiple hits)
+        const knockback = new THREE.Vector3().subVectors(playerPos, megaZombiePos);
+        knockback.y = 0;
+        playerPos.add(knockback.normalize().multiplyScalar(5));
+        this.playerCar.setSpeed(this.playerCar.getSpeed() * 0.3);
         megaZombie.markAttackHit();
       }
 
-      // Check if mega zombie is hit by rockets
-      for (const rocket of allRockets) {
-        if (!rocket.hasExploded() && megaZombie.checkCollision(rocket.getPosition(), 1)) {
-          // Mega zombie takes 3 rocket hits to destroy (just destroy on any hit for now)
-          megaZombie.destroy();
-
-          // Create rocket explosion
-          rocket.explode();
-          const rocketExplosion = rocket.getExplosion();
-          if (rocketExplosion) {
-            this.scene.add(rocketExplosion.getExplosion());
-          }
-
-          // Create slime effect at mega zombie position
-          const slime = new Slime(megaZombiePos.clone());
-          this.slimes.push(slime);
-          this.scene.add(slime.getSlime());
-
-          break;
-        }
-      }
+      this.applyRocketHits(megaZombie, allRockets);
     }
 
     // Update camera position and rotation
@@ -772,6 +640,58 @@ export class Game {
     // Render scene
     this.renderer.render(this.scene, this.camera);
     requestAnimationFrame(() => this.animate());
+  }
+
+  private addSlime(position: THREE.Vector3) {
+    const slime = new Slime(position.clone());
+    this.slimes.push(slime);
+    this.scene.add(slime.getSlime());
+  }
+
+  private applyRocketHits(enemy: ZombieBase, rockets: Rocket[]) {
+    for (const rocket of rockets) {
+      if (rocket.hasExploded() || !enemy.checkCollision(rocket.getPosition(), 1)) continue;
+      enemy.destroy();
+      rocket.explode();
+      const explosion = rocket.getExplosion();
+      if (explosion) this.scene.add(explosion.getExplosion());
+      this.addSlime(enemy.getPosition());
+      return;
+    }
+  }
+
+  private updateThrownTrash(zombie: Zombie, playerPos: THREE.Vector3, deltaTime: number) {
+    const thrownTrash = zombie.getThrownTrash();
+    for (let j = thrownTrash.length - 1; j >= 0; j--) {
+      const trash = thrownTrash[j];
+      const mesh = trash.getTrash();
+      if (!mesh.parent) this.scene.add(mesh);
+
+      const pos = trash.getPosition();
+      trash.update(deltaTime, this.worldGenerator.getHeightAt(pos.x, pos.z));
+
+      if (trash.isAlive() && trash.checkCollision(playerPos, 1.5)) {
+        trash.destroy();
+        this.playerCar.setSpeed(this.playerCar.getSpeed() * 0.85);
+      }
+
+      if (!trash.isAlive()) {
+        this.scene.remove(mesh);
+        thrownTrash.splice(j, 1);
+      }
+    }
+  }
+
+  private spawnZombieNear(origin: THREE.Vector3, minRadius: number, maxRadius: number): Zombie {
+    const zombie = new Zombie(randomPointAround(origin, minRadius, maxRadius));
+    this.scene.add(zombie.getZombie());
+    return zombie;
+  }
+
+  private spawnMegaZombieNear(origin: THREE.Vector3, minRadius: number, maxRadius: number): MegaZombie {
+    const megaZombie = new MegaZombie(randomPointAround(origin, minRadius, maxRadius));
+    this.scene.add(megaZombie.getZombie());
+    return megaZombie;
   }
 
   public handleResize(width: number, height: number) {
