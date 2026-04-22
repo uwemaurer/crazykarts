@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { Trash } from './Trash';
 
 export class Zombie {
   private zombie: THREE.Group;
@@ -13,6 +14,10 @@ export class Zombie {
   private leftArm: THREE.Mesh;
   private rightArm: THREE.Mesh;
   private torso: THREE.Mesh;
+  private thrownTrash: Trash[] = [];
+  private throwCooldown: number = 0;
+  private readonly THROW_COOLDOWN = 2; // Throw every 2 seconds
+  private readonly THROW_RANGE = 20; // Throw when player is within 20 units
 
   constructor(startPosition: THREE.Vector3) {
     this.zombie = new THREE.Group();
@@ -148,6 +153,15 @@ export class Zombie {
 
     const distance = direction.length();
 
+    // Update throw cooldown
+    this.throwCooldown -= deltaTime;
+
+    // Throw trash at player if in range and cooldown is ready
+    if (distance < this.THROW_RANGE && distance > 3 && this.throwCooldown <= 0) {
+      this.throwTrash(targetPosition);
+      this.throwCooldown = this.THROW_COOLDOWN;
+    }
+
     if (distance > 0.5) {
       // Normalize and move towards target
       direction.normalize();
@@ -194,5 +208,28 @@ export class Zombie {
 
   public getRadius(): number {
     return this.ZOMBIE_RADIUS;
+  }
+
+  private throwTrash(targetPosition: THREE.Vector3): void {
+    // Calculate throw position (from zombie's hand height)
+    const throwPosition = this.zombie.position.clone();
+    throwPosition.y += 1.5; // Hand height
+
+    // Calculate direction to target
+    const direction = new THREE.Vector3().subVectors(targetPosition, throwPosition);
+    direction.y = 0; // Throw horizontally, let physics handle the arc
+
+    // Create and add trash
+    const trash = new Trash(throwPosition, direction, 12);
+    this.thrownTrash.push(trash);
+  }
+
+  public getThrownTrash(): Trash[] {
+    return this.thrownTrash;
+  }
+
+  public cleanupTrash(): void {
+    // Remove dead trash from the array
+    this.thrownTrash = this.thrownTrash.filter(trash => trash.isAlive());
   }
 }
