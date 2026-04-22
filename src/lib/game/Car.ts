@@ -62,213 +62,223 @@ export class Car {
   }
 
   private createCar(color: number) {
-    // Main body group to hold all bicycle parts
     const bodyGroup = new THREE.Group();
-    
-    // Create frame
-    const frameGroup = new THREE.Group();
-    
-    // Main frame tube (from seat to pedals)
-    const seatTubeGeometry = new THREE.CylinderGeometry(0.05, 0.05, 1.2, 8);
-    const frameMaterial = new THREE.MeshStandardMaterial({ 
-      color: color,
-      metalness: 0.8,
-      roughness: 0.2
-    });
-    const seatTube = new THREE.Mesh(seatTubeGeometry, frameMaterial);
-    seatTube.position.y = 0.8;
-    seatTube.rotation.x = -Math.PI * 0.15;
-    frameGroup.add(seatTube);
 
-    // Top tube (from seat to handlebars)
-    const topTubeGeometry = new THREE.CylinderGeometry(0.05, 0.05, 1.0, 8);
-    const topTube = new THREE.Mesh(topTubeGeometry, frameMaterial);
-    topTube.position.set(0, 1.1, -0.3);
-    topTube.rotation.z = Math.PI / 2;
-    frameGroup.add(topTube);
+    const frameMaterial = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, metalness: 0.7, roughness: 0.4 });
+    const panelMaterial = new THREE.MeshStandardMaterial({ color, metalness: 0.3, roughness: 0.55 });
+    const rubberMaterial = new THREE.MeshPhongMaterial({ color: 0x0d0d0d, shininess: 5 });
+    const seatMaterial = new THREE.MeshPhongMaterial({ color: 0x1a1a1a, shininess: 30 });
+    const chromeMaterial = new THREE.MeshStandardMaterial({ color: 0xbbbbbb, metalness: 0.9, roughness: 0.15 });
+    const skinMaterial = new THREE.MeshPhongMaterial({ color: 0xffcc99, shininess: 30 });
+    const clothingMaterial = new THREE.MeshPhongMaterial({ color: 0x2244aa, shininess: 20 });
+    const helmetMaterial = new THREE.MeshPhongMaterial({ color: 0x101010, shininess: 80 });
+    const visorMaterial = new THREE.MeshPhongMaterial({ color: 0x223366, shininess: 100, transparent: true, opacity: 0.75 });
 
-    // Down tube (from pedals to handlebars)
-    const downTubeGeometry = new THREE.CylinderGeometry(0.05, 0.05, 1.4, 8);
-    const downTube = new THREE.Mesh(downTubeGeometry, frameMaterial);
-    downTube.position.set(0, 0.7, -0.3);
-    downTube.rotation.x = Math.PI * 0.3;
-    frameGroup.add(downTube);
+    const chassis = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.25, 2.4), frameMaterial);
+    chassis.position.y = 0.65;
+    chassis.castShadow = true;
+    bodyGroup.add(chassis);
 
-    // Handlebar stem
-    const stemGeometry = new THREE.CylinderGeometry(0.05, 0.05, 0.4, 8);
-    const stem = new THREE.Mesh(stemGeometry, frameMaterial);
-    stem.position.set(0, 1.2, -0.6);
-    frameGroup.add(stem);
+    const tank = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.4, 1.0), panelMaterial);
+    tank.position.set(0, 1.0, -0.3);
+    tank.castShadow = true;
+    bodyGroup.add(tank);
 
-    // Handlebars
-    const handlebarGeometry = new THREE.CylinderGeometry(0.03, 0.03, 0.6, 8);
-    const handlebar = new THREE.Mesh(handlebarGeometry, frameMaterial);
-    handlebar.position.set(0, 1.4, -0.6);
+    const seat = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.2, 0.7), seatMaterial);
+    seat.position.set(0, 1.0, 0.5);
+    seat.castShadow = true;
+    bodyGroup.add(seat);
+
+    const fairing = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.5, 0.4), panelMaterial);
+    fairing.position.set(0, 0.95, -1.1);
+    fairing.castShadow = true;
+    bodyGroup.add(fairing);
+
+    const headlight = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.18, 0.18, 0.12, 12),
+      new THREE.MeshStandardMaterial({ color: 0xffffbb, emissive: 0xffffaa, emissiveIntensity: 0.35, roughness: 0.2, metalness: 0.3 }),
+    );
+    headlight.position.set(0, 0.95, -1.32);
+    headlight.rotation.x = Math.PI / 2;
+    bodyGroup.add(headlight);
+
+    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.35, 8), frameMaterial);
+    stem.position.set(0, 1.15, -0.95);
+    stem.rotation.x = Math.PI * 0.1;
+    bodyGroup.add(stem);
+
+    const handlebar = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.04, 1.1, 8), chromeMaterial);
+    handlebar.position.set(0, 1.3, -0.85);
     handlebar.rotation.z = Math.PI / 2;
-    frameGroup.add(handlebar);
+    bodyGroup.add(handlebar);
 
-    // Seat
-    const seatGeometry = new THREE.BoxGeometry(0.2, 0.05, 0.4);
-    const seatMaterial = new THREE.MeshPhongMaterial({ color: 0x111111 });
-    const seat = new THREE.Mesh(seatGeometry, seatMaterial);
-    seat.position.set(0, 1.2, 0.2);
-    frameGroup.add(seat);
+    const gripGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.2, 8);
+    for (const xSign of [-1, 1]) {
+      const grip = new THREE.Mesh(gripGeom, rubberMaterial);
+      grip.position.set(xSign * 0.55, 1.3, -0.85);
+      grip.rotation.z = Math.PI / 2;
+      bodyGroup.add(grip);
+    }
 
-    // Pedal system
-    const pedalHubGeometry = new THREE.CylinderGeometry(0.1, 0.1, 0.1, 16);
-    const pedalHub = new THREE.Mesh(pedalHubGeometry, frameMaterial);
-    pedalHub.position.set(0, 0.4, 0);
-    pedalHub.rotation.z = Math.PI / 2;
-    frameGroup.add(pedalHub);
+    const rack = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.06, 0.6), frameMaterial);
+    rack.position.set(0, 1.05, 1.1);
+    bodyGroup.add(rack);
 
-    // Pedals
-    const pedalGeometry = new THREE.BoxGeometry(0.1, 0.02, 0.2);
-    const leftPedal = new THREE.Mesh(pedalGeometry, seatMaterial);
-    leftPedal.position.set(-0.2, 0.4, 0);
-    frameGroup.add(leftPedal);
+    const footrestGeom = new THREE.BoxGeometry(0.15, 0.05, 0.5);
+    for (const xSign of [-1, 1]) {
+      const fr = new THREE.Mesh(footrestGeom, frameMaterial);
+      fr.position.set(xSign * 0.7, 0.55, 0.35);
+      bodyGroup.add(fr);
+    }
 
-    const rightPedal = new THREE.Mesh(pedalGeometry, seatMaterial);
-    rightPedal.position.set(0.2, 0.4, 0);
-    frameGroup.add(rightPedal);
+    const fenderGeom = new THREE.TorusGeometry(0.58, 0.08, 4, 10, Math.PI);
+    for (const z of [-1.0, 1.0]) {
+      for (const xSign of [-1, 1]) {
+        const fender = new THREE.Mesh(fenderGeom, panelMaterial);
+        fender.position.set(xSign * 0.75, 0.5, z);
+        fender.rotation.y = Math.PI / 2;
+        fender.castShadow = true;
+        bodyGroup.add(fender);
+      }
+    }
 
-    bodyGroup.add(frameGroup);
+    const exhaust = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 1.1, 8), chromeMaterial);
+    exhaust.position.set(0.55, 0.8, 0.3);
+    exhaust.rotation.x = Math.PI / 2;
+    bodyGroup.add(exhaust);
+    const exhaustTip = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.08, 0.16, 8), chromeMaterial);
+    exhaustTip.position.set(0.55, 0.8, 0.9);
+    exhaustTip.rotation.x = Math.PI / 2;
+    bodyGroup.add(exhaustTip);
 
-    // Create rider
     const riderGroup = new THREE.Group();
-    
-    // Rider body material
-    const riderMaterial = new THREE.MeshPhongMaterial({ 
-      color: 0x2244aa,  // Blue clothing
-      shininess: 30 
-    });
-    const skinMaterial = new THREE.MeshPhongMaterial({ 
-      color: 0xffcc99,  // Skin tone
-      shininess: 30 
-    });
 
-    // Torso (leaning forward)
-    const torsoGeometry = new THREE.BoxGeometry(0.3, 0.4, 0.2);
-    const torso = new THREE.Mesh(torsoGeometry, riderMaterial);
-    torso.position.set(0, 1.2, 0);
-    torso.rotation.x = Math.PI * 0.25; // Lean forward
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.6, 0.3), clothingMaterial);
+    torso.position.set(0, 1.55, 0.1);
+    torso.rotation.x = Math.PI * 0.08;
+    torso.castShadow = true;
     riderGroup.add(torso);
 
-    // Head
-    const headGeometry = new THREE.SphereGeometry(0.15, 16, 16);
-    const head = new THREE.Mesh(headGeometry, skinMaterial);
-    head.position.set(0, 1.5, -0.1);
-    riderGroup.add(head);
+    const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.22, 12, 10), helmetMaterial);
+    helmet.position.set(0, 2.0, 0.0);
+    helmet.castShadow = true;
+    riderGroup.add(helmet);
 
-    // Arms
-    const armGeometry = new THREE.CylinderGeometry(0.05, 0.05, 0.4, 8);
-    
-    // Left arm
-    const leftArm = new THREE.Mesh(armGeometry, skinMaterial);
-    leftArm.position.set(-0.2, 1.3, -0.3);
-    leftArm.rotation.z = -Math.PI * 0.15;
-    leftArm.rotation.x = Math.PI * 0.25;
-    riderGroup.add(leftArm);
+    const visor = new THREE.Mesh(
+      new THREE.SphereGeometry(0.21, 12, 6, 0, Math.PI * 2, Math.PI * 0.32, Math.PI * 0.3),
+      visorMaterial,
+    );
+    visor.position.set(0, 2.0, 0.0);
+    visor.rotation.x = Math.PI * 0.08;
+    riderGroup.add(visor);
 
-    // Right arm
-    const rightArm = new THREE.Mesh(armGeometry, skinMaterial);
-    rightArm.position.set(0.2, 1.3, -0.3);
-    rightArm.rotation.z = Math.PI * 0.15;
-    rightArm.rotation.x = Math.PI * 0.25;
-    riderGroup.add(rightArm);
+    const armGeom = new THREE.CylinderGeometry(0.08, 0.07, 0.55, 8);
+    for (const xSign of [-1, 1]) {
+      const arm = new THREE.Mesh(armGeom, clothingMaterial);
+      arm.position.set(xSign * 0.36, 1.5, -0.25);
+      arm.rotation.x = -Math.PI * 0.35;
+      arm.rotation.z = xSign * Math.PI * 0.08;
+      arm.castShadow = true;
+      riderGroup.add(arm);
+    }
 
-    // Legs
-    const thighGeometry = new THREE.CylinderGeometry(0.07, 0.07, 0.4, 8);
-    const calfGeometry = new THREE.CylinderGeometry(0.06, 0.06, 0.4, 8);
+    const handGeom = new THREE.SphereGeometry(0.1, 8, 8);
+    for (const xSign of [-1, 1]) {
+      const hand = new THREE.Mesh(handGeom, skinMaterial);
+      hand.position.set(xSign * 0.5, 1.3, -0.8);
+      riderGroup.add(hand);
+    }
 
-    // Left leg
-    const leftThigh = new THREE.Mesh(thighGeometry, riderMaterial);
-    leftThigh.position.set(-0.12, 0.9, 0.1);
-    leftThigh.rotation.x = -Math.PI * 0.4;
-    riderGroup.add(leftThigh);
+    const thighGeom = new THREE.CylinderGeometry(0.11, 0.1, 0.55, 8);
+    for (const xSign of [-1, 1]) {
+      const thigh = new THREE.Mesh(thighGeom, clothingMaterial);
+      thigh.position.set(xSign * 0.22, 1.2, 0.35);
+      thigh.rotation.x = Math.PI * 0.5;
+      thigh.castShadow = true;
+      riderGroup.add(thigh);
+    }
 
-    const leftCalf = new THREE.Mesh(calfGeometry, riderMaterial);
-    leftCalf.position.set(-0.12, 0.6, 0);
-    leftCalf.rotation.x = Math.PI * 0.2;
-    riderGroup.add(leftCalf);
+    const shinGeom = new THREE.CylinderGeometry(0.09, 0.07, 0.55, 8);
+    for (const xSign of [-1, 1]) {
+      const shin = new THREE.Mesh(shinGeom, clothingMaterial);
+      shin.position.set(xSign * 0.32, 0.85, 0.4);
+      shin.castShadow = true;
+      riderGroup.add(shin);
+    }
 
-    // Right leg
-    const rightThigh = new THREE.Mesh(thighGeometry, riderMaterial);
-    rightThigh.position.set(0.12, 0.9, 0.1);
-    rightThigh.rotation.x = -Math.PI * 0.4;
-    riderGroup.add(rightThigh);
-
-    const rightCalf = new THREE.Mesh(calfGeometry, riderMaterial);
-    rightCalf.position.set(0.12, 0.6, 0);
-    rightCalf.rotation.x = Math.PI * 0.2;
-    riderGroup.add(rightCalf);
-
-    // Add rider to the bicycle
     bodyGroup.add(riderGroup);
 
-    // Create wheels with spokes
     const wheelRadius = 0.5;
-    const wheelThickness = 0.1;
-    const wheelGeometry = new THREE.TorusGeometry(wheelRadius, wheelThickness, 8, 24);
-    const wheelMaterial = new THREE.MeshPhongMaterial({ 
-      color: 0x222222,
-      shininess: 30
-    });
-    const rimMaterial = new THREE.MeshStandardMaterial({ 
-      color: 0x888888,
-      metalness: 0.8,
-      roughness: 0.2
-    });
+    const wheelThickness = 0.3;
+    const tireGeom = new THREE.CylinderGeometry(wheelRadius, wheelRadius, wheelThickness, 16);
+    const rimGeom = new THREE.CylinderGeometry(wheelRadius * 0.55, wheelRadius * 0.55, wheelThickness + 0.02, 12);
+    const hubGeom = new THREE.CylinderGeometry(0.1, 0.1, wheelThickness + 0.04, 8);
+    const tireMat = new THREE.MeshPhongMaterial({ color: 0x1a1a1a, shininess: 5 });
+    const rimMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.8, roughness: 0.3 });
+    const treadGeom = new THREE.BoxGeometry(wheelThickness + 0.02, 0.09, 0.14);
+    const treadCount = 12;
 
-    // Function to create a wheel with spokes
     const createWheel = (x: number, y: number, z: number, group: THREE.Group) => {
-      const wheelPivot = new THREE.Group();
-      wheelPivot.position.set(x, y, z);
-      
-      const wheel = new THREE.Mesh(wheelGeometry, wheelMaterial);
-      wheel.rotation.y = Math.PI / 2;
-      wheel.castShadow = true;
+      const pivot = new THREE.Group();
+      pivot.position.set(x, y, z);
 
-      // Add spokes
-      const spokeCount = 8;
-      for (let i = 0; i < spokeCount; i++) {
-        const spokeGeometry = new THREE.CylinderGeometry(0.01, 0.01, wheelRadius * 2, 4);
-        const spoke = new THREE.Mesh(spokeGeometry, rimMaterial);
-        spoke.rotation.z = (Math.PI / spokeCount) * i;
-        wheel.add(spoke);
+      const wheel = new THREE.Group();
+
+      const tire = new THREE.Mesh(tireGeom, tireMat);
+      tire.rotation.z = Math.PI / 2;
+      tire.castShadow = true;
+      wheel.add(tire);
+
+      const rim = new THREE.Mesh(rimGeom, rimMat);
+      rim.rotation.z = Math.PI / 2;
+      wheel.add(rim);
+
+      const hub = new THREE.Mesh(hubGeom, rimMat);
+      hub.rotation.z = Math.PI / 2;
+      wheel.add(hub);
+
+      for (let i = 0; i < treadCount; i++) {
+        const angle = (i / treadCount) * Math.PI * 2;
+        const tread = new THREE.Mesh(treadGeom, tireMat);
+        tread.position.set(0, Math.sin(angle) * wheelRadius, Math.cos(angle) * wheelRadius);
+        tread.rotation.x = angle;
+        wheel.add(tread);
       }
 
-      wheelPivot.add(wheel);
-      group.add(wheelPivot);
+      pivot.add(wheel);
+      group.add(pivot);
     };
 
-    // Create wheels
-    createWheel(0, 0.5, -0.6, this.frontWheels); // Front wheel
-    createWheel(0, 0.5, 0.6, this.rearWheels);   // Rear wheel
+    const wheelY = 0.5;
+    const wheelX = 0.75;
+    createWheel(-wheelX, wheelY, -1.0, this.frontWheels);
+    createWheel(wheelX, wheelY, -1.0, this.frontWheels);
+    createWheel(-wheelX, wheelY, 1.0, this.rearWheels);
+    createWheel(wheelX, wheelY, 1.0, this.rearWheels);
 
-    // Position the wheel groups at the bicycle's center
     this.frontWheels.position.set(0, 0, 0);
     this.rearWheels.position.set(0, 0, 0);
 
-    // Add cannon (mounted on handlebars)
-    const cannonGeometry = new THREE.CylinderGeometry(0.1, 0.1, 0.8, 8);
-    const cannonMaterial = new THREE.MeshStandardMaterial({ 
-      color: 0x333333,
-      metalness: 0.8,
-      roughness: 0.2
-    });
-    const cannonMesh = new THREE.Mesh(cannonGeometry, cannonMaterial);
-    cannonMesh.rotation.x = Math.PI / 2;
-    cannonMesh.position.y = 1.4;
-    cannonMesh.position.z = -0.8;
-    this.cannon.add(cannonMesh);
+    const launcherTube = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.13, 0.9, 10), frameMaterial);
+    launcherTube.position.set(0, 1.35, -0.85);
+    launcherTube.rotation.x = Math.PI / 2;
+    launcherTube.castShadow = true;
+    this.cannon.add(launcherTube);
 
-    // Add all parts to the bicycle
+    const launcherMuzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.13, 0.14, 10), frameMaterial);
+    launcherMuzzle.position.set(0, 1.35, -1.32);
+    launcherMuzzle.rotation.x = Math.PI / 2;
+    this.cannon.add(launcherMuzzle);
+
+    const launcherMount = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.15, 0.4), frameMaterial);
+    launcherMount.position.set(0, 1.22, -0.75);
+    this.cannon.add(launcherMount);
+
     this.car.add(bodyGroup);
     this.car.add(this.cannon);
     this.car.add(this.frontWheels);
     this.car.add(this.rearWheels);
 
-    // Set initial position
     this.car.position.copy(this.position);
   }
 
@@ -402,13 +412,9 @@ export class Car {
     this.steeringAngle = Math.max(-this.MAX_STEERING_ANGLE, 
                                  Math.min(this.MAX_STEERING_ANGLE, this.steeringAngle));
 
-    // Update front wheels visual rotation for steering
-    this.frontWheels.rotation.y = this.steeringAngle;
-
-    // Update wheel rotation based on speed
     this.wheelRotation += this.speed * this.WHEEL_ROTATION_SPEED * deltaTime;
-    // Apply wheel rotation around their local X axis
     this.frontWheels.children.forEach(wheelPivot => {
+      wheelPivot.rotation.y = this.steeringAngle;
       wheelPivot.children[0].rotation.x = this.wheelRotation;
     });
     this.rearWheels.children.forEach(wheelPivot => {
@@ -437,9 +443,8 @@ export class Car {
       this.handleStuckState(deltaTime);
     }
 
-    // Calculate movement based on current speed and steering angle
-    const direction = new THREE.Vector3(0, 0, -1);
-    direction.applyQuaternion(this.car.quaternion);
+    const yaw = this.car.rotation.y;
+    const direction = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
     const movement = direction.multiplyScalar(this.speed * deltaTime);
     const newPosition = this.car.position.clone().add(movement);
 

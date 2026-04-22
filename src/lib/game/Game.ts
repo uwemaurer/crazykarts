@@ -1,12 +1,11 @@
 import * as THREE from 'three';
-import { RaceTrack } from './RaceTrack';
 import { Car } from './Car';
 import { Rocket } from './Rocket';
-import { Explosion } from './Explosion';
 import { Zombie } from './Zombie';
 import { MegaZombie } from './MegaZombie';
 import { ZombieBase } from './ZombieBase';
 import { Slime } from './Slime';
+import { DirtParticles } from './DirtParticles';
 import * as TPane from 'tweakpane';
 import { WorldGenerator } from './WorldGenerator';
 import type { WorldChunk } from './WorldGenerator';
@@ -21,13 +20,19 @@ export class Game {
   private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
   private renderer: THREE.WebGLRenderer;
-  private track: RaceTrack = new RaceTrack();
   private playerCar: Car = new Car(0xff0000, new THREE.Vector3(0, 0, 15));
   private buddies: Car[] = [];
   private opponents: Car[] = [];
   private zombies: Zombie[] = [];
   private megaZombies: MegaZombie[] = [];
   private slimes: Slime[] = [];
+  private dirt = new DirtParticles();
+  private dirtAccumulator = 0;
+  private carVerticalVelocity = 0;
+  private readonly CAR_GRAVITY = 22;
+  private readonly CAR_SUSPENSION_STIFFNESS = 300;
+  private readonly CAR_SUSPENSION_DAMPING = 14;
+  private readonly CAR_AIRBORNE_GAP = 1.2;
   private clock: THREE.Clock;
   private keyStates: { [key: string]: boolean } = {};
   private titleElement: HTMLDivElement | null = null;
@@ -37,37 +42,21 @@ export class Game {
     playerSpeed: 0,
     targetSpeed: 0,
     fps: 0,
-    position: { x: 0, z: 0 },
-    rotation: 0
+    position: { x: 0, y: 0, z: 0 },
+    rotation: 0,
+    groundY: 0,
+    verticalVelocity: 0,
   };
-  private static readonly TRACK_BOUNDS = {
-    front: 25,  // Half of TRACK_LENGTH - some margin
-    back: -25,
-    left: -8,   // Half of TRACK_WIDTH - some margin
-    right: 8
-  };
-  private static readonly OPPONENT_BOUNDS = {
-    front: 45,
-    back: -45,
-    left: -45,
-    right: 45
-  };
-
-  private static readonly TRACK_AREA = {
-    width: 20, // Track width
-    length: 60, // Track length
-    halfWidth: 10,
-    halfLength: 30
-  };
-
-  // Game constants
-  private static readonly MAX_SPEED = 25; // Reduced from 40 for better control
-  private static readonly MAX_REVERSE_SPEED = -15; // Reduced from -20
-  private static readonly TURN_SPEED = 1; // Normalized turn input (will be multiplied by steering angle)
+  private static readonly MAX_SPEED = 25;
+  private static readonly MAX_REVERSE_SPEED = -15;
+  private static readonly TURN_SPEED = 1;
 
   private worldGenerator: WorldGenerator;
   private chunks: Map<string, WorldChunk>;
-  private readonly RENDER_DISTANCE = 2;
+  private readonly RENDER_DISTANCE = 4;
+  private readonly CAR_RIDE_HEIGHT = 0;
+  private readonly CAR_WHEELBASE_HALF = 1.0;
+  private readonly CAR_TRACK_HALF = 0.75;
 
   constructor(container: HTMLElement) {
     this.scene = new THREE.Scene();
@@ -78,6 +67,7 @@ export class Game {
       1000
     );
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.shadowMap.enabled = true;
     container.appendChild(this.renderer.domElement);
@@ -149,10 +139,10 @@ export class Game {
     this.scene.add(sky);
 
     // Add fog for depth
-    this.scene.fog = new THREE.Fog(0x87CEEB, 50, 150);
+    this.scene.fog = new THREE.Fog(0x87CEEB, 60, 180);
 
     // Add ambient light
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
     this.scene.add(ambientLight);
 
     // Add directional light (sun)
@@ -164,20 +154,21 @@ export class Game {
     directionalLight.shadow.mapSize.width = 2048;
     directionalLight.shadow.mapSize.height = 2048;
     directionalLight.shadow.camera.near = 0.5;
-    directionalLight.shadow.camera.far = 50;
-    directionalLight.shadow.camera.left = -30;
-    directionalLight.shadow.camera.right = 30;
-    directionalLight.shadow.camera.top = 30;
-    directionalLight.shadow.camera.bottom = -30;
+    directionalLight.shadow.camera.far = 200;
+    directionalLight.shadow.camera.left = -80;
+    directionalLight.shadow.camera.right = 80;
+    directionalLight.shadow.camera.top = 80;
+    directionalLight.shadow.camera.bottom = -80;
     
     this.scene.add(directionalLight);
 
-    // Initialize chunks around starting position
     this.initializeChunks();
 
-    // Add player car
-    this.playerCar = new Car(0xff0000, new THREE.Vector3(0, 0, 0));
+    const spawnY = this.sampleHeightInterp(0, 0) + this.CAR_RIDE_HEIGHT;
+    this.playerCar = new Car(0xff0000, new THREE.Vector3(0, spawnY, 0));
+    this.playerCar.getCar().rotation.order = 'YXZ';
     this.scene.add(this.playerCar.getCar());
+    this.scene.add(this.dirt.getGroup());
 
     // Buddies and opponents removed - only player and zombies now
 
@@ -205,23 +196,25 @@ export class Game {
       this.scene.add(megaZombie.getZombie());
     }
 
-    // Initial camera position
-    this.camera.position.set(0, 5, 30);
-    this.camera.lookAt(0, 0, 0);
+    this.camera.position.set(0, spawnY + 8, 11);
+    this.camera.lookAt(0, spawnY, -12);
   }
 
   private setupControls() {
     window.addEventListener('keydown', (event) => {
       this.keyStates[event.code] = true;
       
-      // Handle space key press for firing rockets
       if (event.code === 'Space') {
         const rocket = this.playerCar.fireRocket();
-        // Rocket position is already set by fireRocket() from cannon position
         this.scene.add(rocket.getRocket());
       }
 
-      // Update car controls based on current key states
+      if (event.code === 'F3') {
+        event.preventDefault();
+        this.debugWireframe = !this.debugWireframe;
+        this.worldGenerator.setWireframe(this.debugWireframe);
+      }
+
       this.updateCarControls();
     });
 
@@ -256,35 +249,26 @@ export class Game {
     const playerCarPosition = this.playerCar.getCar().position;
     const playerCarRotation = this.playerCar.getCar().rotation;
     const playerSpeed = Math.abs(this.playerCar.getSpeed());
-    const speedFactor = playerSpeed / 150; // Based on new max speed
+    const speedFactor = Math.min(playerSpeed / Game.MAX_SPEED, 1);
 
-    // Dynamic camera position based on speed - adjusted for higher speeds
-    const cameraHeight = 4 + speedFactor * 4; // Higher at high speeds (was 2)
-    const cameraDistance = 12 + speedFactor * 8; // Much further back at high speeds (was 4)
+    const cameraHeight = 8 + speedFactor * 3;
+    const cameraDistance = 11 + speedFactor * 5;
     const cameraOffset = new THREE.Vector3(0, cameraHeight, cameraDistance);
     cameraOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), playerCarRotation.y);
-    
-    // Faster camera tracking at high speeds
-    const lerpFactor = 0.15 + speedFactor * 0.15; // More responsive camera (was 0.1)
+
+    const lerpFactor = 0.15 + speedFactor * 0.15;
     this.camera.position.lerp(playerCarPosition.clone().add(cameraOffset), lerpFactor);
 
-    // Look much further ahead at higher speeds
-    const lookAheadDistance = 15 + speedFactor * 25; // Look further ahead (was 10)
+    const lookAheadDistance = 12 + speedFactor * 10;
     const lookAtOffset = new THREE.Vector3(0, 0, -lookAheadDistance);
     lookAtOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), playerCarRotation.y);
     const lookAtPosition = playerCarPosition.clone().add(lookAtOffset);
-    
-    // Faster camera rotation at high speeds
+
     const currentLookAt = new THREE.Vector3();
     this.camera.getWorldDirection(currentLookAt);
     const targetLookAt = lookAtPosition.clone().sub(this.camera.position).normalize();
     currentLookAt.lerp(targetLookAt, lerpFactor);
     this.camera.lookAt(this.camera.position.clone().add(currentLookAt));
-  }
-
-  private isOnTrack(position: THREE.Vector3): boolean {
-    return Math.abs(position.x) < Game.TRACK_AREA.halfWidth &&
-           Math.abs(position.z) < Game.TRACK_AREA.halfLength;
   }
 
   private setupDebugPane() {
@@ -324,9 +308,24 @@ export class Game {
       readonly: true,
       format: (v: number) => v.toFixed(1)
     });
+    positionFolder.addBinding(this.debugValues.position, 'y', {
+      readonly: true,
+      format: (v: number) => v.toFixed(2)
+    });
     positionFolder.addBinding(this.debugValues.position, 'z', {
       readonly: true,
       format: (v: number) => v.toFixed(1)
+    });
+
+    this.debugPane.addBinding(this.debugValues, 'groundY', {
+      readonly: true,
+      label: 'Ground Y',
+      format: (v: number) => v.toFixed(2)
+    });
+    this.debugPane.addBinding(this.debugValues, 'verticalVelocity', {
+      readonly: true,
+      label: 'Vertical Vel',
+      format: (v: number) => v.toFixed(2)
     });
 
     // Add rotation monitor
@@ -466,8 +465,15 @@ export class Game {
     return `${x},${z}`;
   }
 
+  private animationStarted = false;
+  private debugWireframe = false;
+
   public animate() {
-    const deltaTime = this.clock.getDelta();
+    if (!this.animationStarted) {
+      this.clock.getDelta();
+      this.animationStarted = true;
+    }
+    const deltaTime = Math.min(this.clock.getDelta(), 0.05);
     
     // Update debug values
     const currentSpeed = this.playerCar.getSpeed();
@@ -476,20 +482,23 @@ export class Game {
     this.debugValues.playerSpeed = currentSpeed;
     this.debugValues.targetSpeed = targetSpeed;
     this.debugValues.fps = 1 / deltaTime;
-    this.debugValues.position.x = this.playerCar.getCar().position.x;
-    this.debugValues.position.z = this.playerCar.getCar().position.z;
+    const carPosNow = this.playerCar.getCar().position;
+    this.debugValues.position.x = carPosNow.x;
+    this.debugValues.position.y = carPosNow.y;
+    this.debugValues.position.z = carPosNow.z;
     this.debugValues.rotation = this.playerCar.getCar().rotation.y;
+    this.debugValues.groundY = this.sampleHeightInterp(carPosNow.x, carPosNow.z);
+    this.debugValues.verticalVelocity = this.carVerticalVelocity;
 
     // Update title if it exists
     this.updateTitle();
 
-    // Update player car (no other cars to collide with)
     this.playerCar.update(deltaTime, []);
 
-    // Keep car on ground
+    this.updateCarSuspension(deltaTime);
     const carPos = this.playerCar.getCar().position;
-    const groundHeight = this.worldGenerator.getHeightAt(carPos.x, carPos.z);
-    carPos.y = groundHeight + 0.5;
+    this.emitDirtParticles(deltaTime);
+    this.dirt.update(deltaTime);
 
     // Update rockets and check collisions
     const allRockets = this.playerCar.getRockets();
@@ -511,32 +520,11 @@ export class Game {
         continue;
       }
 
-      // Only check collisions if rocket hasn't exploded yet
       if (!rocket.hasExploded()) {
         const rocketPos = rocket.getPosition();
         const groundHeight = this.worldGenerator.getHeightAt(rocketPos.x, rocketPos.z);
-
-        // Check if rocket hit the ground
         if (rocketPos.y <= groundHeight + 0.2) {
-          rocket.explode();
-          const rocketExplosion = rocket.getExplosion();
-          if (rocketExplosion) {
-            this.scene.add(rocketExplosion.getExplosion());
-          }
-          continue;
-        }
-
-        // Check environment collisions (trees, etc)
-        const collision = this.track.checkRocketCollision(rocket.getPosition());
-        if (collision.object) {
-          rocket.explode();
-          if (collision.type === 'tree') {
-            this.track.setTreeOnFire(collision.object as THREE.Group);
-          }
-          const rocketExplosion = rocket.getExplosion();
-          if (rocketExplosion) {
-            this.scene.add(rocketExplosion.getExplosion());
-          }
+          this.detonateRocket(rocket);
         }
       }
     }
@@ -631,15 +619,94 @@ export class Game {
     // Update camera position and rotation
     this.updateCamera();
 
-    // Update track (for burning trees)
-    this.track.update(deltaTime);
-
     // Update world chunks based on player position
     this.updateChunks();
 
     // Render scene
     this.renderer.render(this.scene, this.camera);
     requestAnimationFrame(() => this.animate());
+  }
+
+  private sampleHeightInterp(x: number, z: number): number {
+    const x0 = Math.floor(x);
+    const z0 = Math.floor(z);
+    const fx = x - x0;
+    const fz = z - z0;
+    const h00 = this.worldGenerator.getHeightAt(x0, z0);
+    const h10 = this.worldGenerator.getHeightAt(x0 + 1, z0);
+    const h01 = this.worldGenerator.getHeightAt(x0, z0 + 1);
+    const h11 = this.worldGenerator.getHeightAt(x0 + 1, z0 + 1);
+    return (1 - fx) * (1 - fz) * h00 + fx * (1 - fz) * h10 + (1 - fx) * fz * h01 + fx * fz * h11;
+  }
+
+  private emitDirtParticles(deltaTime: number): void {
+    const speed = Math.abs(this.playerCar.getSpeed());
+    if (speed < 3) return;
+
+    this.dirtAccumulator += deltaTime;
+    const emitInterval = 0.04;
+    if (this.dirtAccumulator < emitInterval) return;
+    this.dirtAccumulator = 0;
+
+    const car = this.playerCar.getCar();
+    const yaw = car.rotation.y;
+    const sinY = Math.sin(yaw);
+    const cosY = Math.cos(yaw);
+    const REAR = 1.1;
+    const SIDE = this.CAR_TRACK_HALF;
+
+    const movingForward = this.playerCar.getSpeed() > 0;
+    const backDir = new THREE.Vector3(movingForward ? sinY : -sinY, 0, movingForward ? cosY : -cosY);
+
+    for (const side of [-1, 1]) {
+      const spawnX = car.position.x + sinY * REAR + cosY * side * SIDE;
+      const spawnZ = car.position.z + cosY * REAR + (-sinY) * side * SIDE;
+      const groundY = this.worldGenerator.getHeightAt(spawnX, spawnZ);
+      const spawnPos = new THREE.Vector3(spawnX, groundY + 0.15, spawnZ);
+      this.dirt.spawn(spawnPos, backDir, 2);
+    }
+  }
+
+  private updateCarSuspension(deltaTime: number): void {
+    const car = this.playerCar.getCar();
+    car.rotation.order = 'YXZ';
+
+    const carPos = car.position;
+    const yaw = car.rotation.y;
+    const sinY = Math.sin(yaw);
+    const cosY = Math.cos(yaw);
+    const FB = this.CAR_WHEELBASE_HALF;
+    const SIDE = this.CAR_TRACK_HALF;
+
+    const sampleWheel = (forward: number, side: number): number => {
+      const wx = carPos.x + (-sinY) * forward * FB + cosY * side * SIDE;
+      const wz = carPos.z + (-cosY) * forward * FB + (-sinY) * side * SIDE;
+      return this.sampleHeightInterp(wx, wz);
+    };
+
+    const hFL = sampleWheel(+1, -1);
+    const hFR = sampleWheel(+1, +1);
+    const hRL = sampleWheel(-1, -1);
+    const hRR = sampleWheel(-1, +1);
+
+    const targetY = (hFL + hFR + hRL + hRR) * 0.25 + this.CAR_RIDE_HEIGHT;
+    const targetPitch = Math.atan2((hFL + hFR) * 0.5 - (hRL + hRR) * 0.5, FB * 2);
+    const targetRoll = Math.atan2((hFR + hRR) * 0.5 - (hFL + hRL) * 0.5, SIDE * 2);
+
+    const gap = carPos.y - targetY;
+    if (gap > this.CAR_AIRBORNE_GAP) {
+      this.carVerticalVelocity -= this.CAR_GRAVITY * deltaTime;
+    } else {
+      const effectiveTarget = targetY + this.CAR_GRAVITY / this.CAR_SUSPENSION_STIFFNESS;
+      const springForce = (effectiveTarget - carPos.y) * this.CAR_SUSPENSION_STIFFNESS;
+      const dampingForce = -this.carVerticalVelocity * this.CAR_SUSPENSION_DAMPING;
+      this.carVerticalVelocity += (springForce + dampingForce - this.CAR_GRAVITY) * deltaTime;
+    }
+    carPos.y += this.carVerticalVelocity * deltaTime;
+
+    const angleLerp = 1 - Math.exp(-deltaTime * 8);
+    car.rotation.x += (targetPitch - car.rotation.x) * angleLerp;
+    car.rotation.z += (targetRoll - car.rotation.z) * angleLerp;
   }
 
   private addSlime(position: THREE.Vector3) {
@@ -652,12 +719,17 @@ export class Game {
     for (const rocket of rockets) {
       if (rocket.hasExploded() || !enemy.checkCollision(rocket.getPosition(), 1)) continue;
       enemy.destroy();
-      rocket.explode();
-      const explosion = rocket.getExplosion();
-      if (explosion) this.scene.add(explosion.getExplosion());
+      this.detonateRocket(rocket);
       this.addSlime(enemy.getPosition());
       return;
     }
+  }
+
+  private detonateRocket(rocket: Rocket) {
+    rocket.explode();
+    const explosion = rocket.getExplosion();
+    if (explosion) this.scene.add(explosion.getExplosion());
+    this.worldGenerator.destroySphere(rocket.getPosition(), 2.5);
   }
 
   private updateThrownTrash(zombie: Zombie, playerPos: THREE.Vector3, deltaTime: number) {
