@@ -4,6 +4,8 @@ import {
   TEX_GRASS_SIDE,
   TEX_GRASS_TOP,
   TEX_LEAVES,
+  TEX_ROAD,
+  TEX_ROOF,
   TEX_SAND,
   TEX_SNOW,
   TEX_SNOW_SIDE,
@@ -168,19 +170,60 @@ function generateSnowSide(data: Uint8Array) {
   }
 }
 
-export function createBlockTextureArray(): THREE.DataArrayTexture {
-  const data = new Uint8Array(TEXTURE_LAYER_COUNT * TILE_PIXELS * 4);
-  generateGrassTop(data);
-  generateGrassSide(data);
-  generateDirt(data);
-  generateStone(data);
-  generateSand(data);
-  generateWoodTop(data);
-  generateWoodSide(data);
-  generateLeaves(data);
-  generateSnow(data);
-  generateSnowSide(data);
+function generateRoad(data: Uint8Array) {
+  for (let y = 0; y < TILE_SIZE; y++) {
+    for (let x = 0; x < TILE_SIZE; x++) {
+      const cellX = x >> 2;
+      const cellY = y >> 2;
+      const offsetY = (cellX & 1) * 2;
+      const rowY = (y + offsetY) >> 2;
+      const stone = (hash(cellX, rowY, 1115) * 1000) | 0;
+      const base = 0.42 + (stone & 15) / 100;
+      const edge = (x & 3) === 0 || ((y + offsetY) & 3) === 0 ? 0.72 : 1.0;
+      const n = hash(x, y, 1116);
+      const shade = base * edge * (0.92 + n * 0.14);
+      setPixel(data, TEX_ROAD, x, y, 0.95 * shade, 0.95 * shade, 0.97 * shade);
+    }
+  }
+}
 
+function generateRoof(data: Uint8Array) {
+  for (let y = 0; y < TILE_SIZE; y++) {
+    for (let x = 0; x < TILE_SIZE; x++) {
+      const n = hash(x, y, 1218);
+      const row = (y >> 1) & 1;
+      const scallop = Math.sin((x + row * 2) * 1.6) * 0.5 + 0.5;
+      const stripe = (y & 3) === 0 ? 0.55 : 1.0;
+      const shade = (0.78 + scallop * 0.28 + n * 0.12) * stripe;
+      setPixel(data, TEX_ROOF, x, y, 0.78 * shade, 0.26 * shade, 0.18 * shade);
+    }
+  }
+}
+
+let cachedBlockData: Uint8Array | null = null;
+
+function getBlockData(): Uint8Array {
+  if (!cachedBlockData) {
+    const data = new Uint8Array(TEXTURE_LAYER_COUNT * TILE_PIXELS * 4);
+    generateGrassTop(data);
+    generateGrassSide(data);
+    generateDirt(data);
+    generateStone(data);
+    generateSand(data);
+    generateWoodTop(data);
+    generateWoodSide(data);
+    generateLeaves(data);
+    generateSnow(data);
+    generateSnowSide(data);
+    generateRoad(data);
+    generateRoof(data);
+    cachedBlockData = data;
+  }
+  return cachedBlockData;
+}
+
+export function createBlockTextureArray(): THREE.DataArrayTexture {
+  const data = getBlockData();
   const texture = new THREE.DataArrayTexture(data, TILE_SIZE, TILE_SIZE, TEXTURE_LAYER_COUNT);
   texture.format = THREE.RGBAFormat;
   texture.type = THREE.UnsignedByteType;
@@ -191,6 +234,45 @@ export function createBlockTextureArray(): THREE.DataArrayTexture {
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.needsUpdate = true;
   return texture;
+}
+
+const tileCanvasCache = new Map<number, HTMLCanvasElement>();
+export function getTileCanvas(layer: number): HTMLCanvasElement {
+  const cached = tileCanvasCache.get(layer);
+  if (cached) return cached;
+  const data = getBlockData();
+  const canvas = document.createElement('canvas');
+  canvas.width = TILE_SIZE;
+  canvas.height = TILE_SIZE;
+  const ctx = canvas.getContext('2d')!;
+  const imgData = ctx.createImageData(TILE_SIZE, TILE_SIZE);
+  const offset = layer * TILE_PIXELS * 4;
+  imgData.data.set(data.subarray(offset, offset + TILE_PIXELS * 4));
+  ctx.putImageData(imgData, 0, 0);
+  tileCanvasCache.set(layer, canvas);
+  return canvas;
+}
+
+const tileDataUrlCache = new Map<number, string>();
+export function getTileDataUrl(layer: number): string {
+  const cached = tileDataUrlCache.get(layer);
+  if (cached) return cached;
+  const url = getTileCanvas(layer).toDataURL();
+  tileDataUrlCache.set(layer, url);
+  return url;
+}
+
+const tileTextureCache = new Map<number, THREE.CanvasTexture>();
+export function getTileTexture(layer: number): THREE.CanvasTexture {
+  const cached = tileTextureCache.get(layer);
+  if (cached) return cached;
+  const tex = new THREE.CanvasTexture(getTileCanvas(layer));
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.generateMipmaps = false;
+  tileTextureCache.set(layer, tex);
+  return tex;
 }
 
 export function createChunkMaterial(texture: THREE.DataArrayTexture): THREE.Material {

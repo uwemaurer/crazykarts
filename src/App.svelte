@@ -73,8 +73,8 @@
     game.setTouchInput(0, 0);
   }
 
-  function onFire() {
-    game.fireRocket();
+  function onMine() {
+    game.primaryAction();
   }
 </script>
 
@@ -107,12 +107,12 @@
     </div>
     <button
       class="fire-button"
-      on:pointerdown={onFire}
-    >FIRE</button>
+      on:pointerdown={onMine}
+    >MINE</button>
   {:else}
     <div class="controls">
-      <p>Use Arrow Keys or WASD to control the car</p>
-      <p>Press SPACE to shoot rockets</p>
+      <p>WASD to walk · Mouse to look (click to capture) · Space to jump</p>
+      <p>Left click: mine · Right click: place · 1–9 or wheel: hotbar · E: help build</p>
     </div>
   {/if}
 </main>
@@ -129,13 +129,22 @@
 
   .controls {
     position: fixed;
-    bottom: 20px;
+    bottom: 90px;
     left: 50%;
     transform: translateX(-50%);
     background: rgba(0, 0, 0, 0.7);
     color: white;
-    padding: 10px 20px;
+    padding: 8px 16px;
     border-radius: 5px;
+    font-size: 12px;
+    line-height: 1.4;
+    text-align: center;
+    pointer-events: none;
+    z-index: 4;
+  }
+
+  .controls p {
+    margin: 2px 0;
   }
 
   .joystick-base {
