@@ -35,6 +35,8 @@ export class Game {
   private readonly CAR_AIRBORNE_GAP = 1.2;
   private clock: THREE.Clock;
   private keyStates: { [key: string]: boolean } = {};
+  private touchSteer = 0;
+  private touchThrottle = 0;
   private titleElement: HTMLDivElement | null = null;
   private titleStartTime: number = 0;
   private debugPane!: TPane.Pane;
@@ -233,16 +235,34 @@ export class Game {
       targetSpeed = Game.MAX_SPEED;
     } else if (this.keyStates['ArrowDown'] || this.keyStates['KeyS']) {
       targetSpeed = Game.MAX_REVERSE_SPEED;
+    } else if (this.touchThrottle > 0) {
+      targetSpeed = this.touchThrottle * Game.MAX_SPEED;
+    } else if (this.touchThrottle < 0) {
+      targetSpeed = -this.touchThrottle * Game.MAX_REVERSE_SPEED;
     }
-    
+
     // Set the target speed - actual acceleration will be handled by the Car class
     this.playerCar.setSpeed(targetSpeed);
 
     // Handle turning
-    const turnSpeed = this.keyStates['ArrowLeft'] || this.keyStates['KeyA'] ? Game.TURN_SPEED :
-                     this.keyStates['ArrowRight'] || this.keyStates['KeyD'] ? -Game.TURN_SPEED :
-                     0;
+    let turnSpeed = this.keyStates['ArrowLeft'] || this.keyStates['KeyA'] ? Game.TURN_SPEED :
+                    this.keyStates['ArrowRight'] || this.keyStates['KeyD'] ? -Game.TURN_SPEED :
+                    0;
+    if (turnSpeed === 0 && this.touchSteer !== 0) {
+      turnSpeed = -this.touchSteer * Game.TURN_SPEED;
+    }
     this.playerCar.setTurnSpeed(turnSpeed);
+  }
+
+  public setTouchInput(steer: number, throttle: number) {
+    this.touchSteer = Math.max(-1, Math.min(1, steer));
+    this.touchThrottle = Math.max(-1, Math.min(1, throttle));
+    this.updateCarControls();
+  }
+
+  public fireRocket() {
+    const rocket = this.playerCar.fireRocket();
+    this.scene.add(rocket.getRocket());
   }
 
   private updateCamera() {
@@ -272,6 +292,11 @@ export class Game {
   }
 
   private setupDebugPane() {
+    // Skip debug pane on touch/small-screen devices — takes up too much room on mobile
+    const isTouch = typeof window !== 'undefined' &&
+      (window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768);
+    if (isTouch) return;
+
     this.debugPane = new TPane.Pane({
       title: 'Debug Values',
       expanded: true
