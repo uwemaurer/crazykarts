@@ -112,7 +112,7 @@
   {:else}
     <div class="controls">
       <p>WASD to walk · Mouse to look (click to capture) · Space to jump</p>
-      <p>Left click: mine · Right click: place · 1–9 or wheel: hotbar · E: help build</p>
+      <p>Left click: mine · Right click: place · 1–9 or wheel: hotbar · E: help build · F3: wireframe · F6: reset · F7: morning · F8: grass</p>
     </div>
   {/if}
 </main>

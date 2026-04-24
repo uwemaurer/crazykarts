@@ -62,6 +62,7 @@ export class GrassSystem {
   private readonly scene: THREE.Scene;
   private readonly worldGenerator: WorldGenerator;
   private readonly chunkMeshes = new Map<string, THREE.InstancedMesh>();
+  private visible = true;
 
   private readonly bladeGeometry: THREE.BufferGeometry;
   private readonly material: THREE.MeshLambertMaterial;
@@ -86,6 +87,12 @@ export class GrassSystem {
 
   public setSunDir(dir: THREE.Vector3): void {
     this.uniforms.uSunDir.value.copy(dir);
+  }
+
+  public setVisible(visible: boolean): void {
+    if (this.visible === visible) return;
+    this.visible = visible;
+    for (const mesh of this.chunkMeshes.values()) mesh.visible = visible;
   }
 
   public update(deltaTime: number): void {
@@ -135,6 +142,7 @@ export class GrassSystem {
     mesh.frustumCulled = true;
     mesh.castShadow = false;
     mesh.receiveShadow = true;
+    mesh.visible = this.visible;
 
     const m = new THREE.Matrix4();
     const q = new THREE.Quaternion();

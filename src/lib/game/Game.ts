@@ -62,7 +62,7 @@ export class Game {
   private readonly MAX_VILLAGERS = 75;
   private readonly REACH = 5;
 
-  private clock: THREE.Clock;
+  private clock: THREE.Timer;
   private keyStates: { [key: string]: boolean } = {};
   private touchForward = 0;
   private touchStrafe = 0;
@@ -71,7 +71,8 @@ export class Game {
   private debugPane!: TPane.Pane;
   private debugValues = {
     fps: 0,
-    renderMs: 0,
+    renderMs: 0,     // CPU-side render dispatch (performance.now() around renderer.render)
+    gpuRenderMs: 0,  // GPU-side render time from EXT_disjoint_timer_query_webgl2 (0 if unsupported)
     triangles: 0,
     drawCalls: 0,
     geometries: 0,
@@ -87,8 +88,20 @@ export class Game {
   private sfx = new Sfx(0.45);
   private skySystem!: SkySystem;
   private grassSystem!: GrassSystem;
+  private grassVisible = true;
   private playerLight!: THREE.PointLight;
   private wasGrounded = true;
+
+  private toastElement!: HTMLDivElement;
+  private toastTimeoutId: number | null = null;
+
+  // EXT_disjoint_timer_query_webgl2 state. In WebGL2 the extension only adds
+  // the TIME_ELAPSED_EXT / GPU_DISJOINT_EXT enums; query objects themselves
+  // use the core WebGL2 query API (gl.createQuery, beginQuery, endQuery, …).
+  // Queries are pipelined: we issue one per frame and poll older ones for
+  // availability on later frames. If the extension is missing this stays inert.
+  private timerExt: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number } | null = null;
+  private pendingGpuQueries: WebGLQuery[] = [];
 
   private worldGenerator: WorldGenerator;
   private nearChunks: Map<string, WorldChunk> = new Map();
@@ -123,7 +136,10 @@ export class Game {
     this.canvas = this.renderer.domElement;
     container.appendChild(this.canvas);
 
-    this.clock = new THREE.Clock();
+    this.clock = new THREE.Timer();
+    // Pauses delta accumulation while the tab is hidden so a 30s background
+    // pause doesn't arrive as one giant frame step.
+    this.clock.connect(document);
     const saved = SaveManager.load();
     this.worldGenerator = new WorldGenerator(saved?.seed);
     if (saved?.diffs) this.worldGenerator.loadDiffs(saved.diffs);
@@ -136,6 +152,8 @@ export class Game {
     this.setupScene(saved);
     if (saved?.inventory) this.inventory.load(saved.inventory);
     this.setupControls();
+    this.setupToast(container);
+    this.setupGpuTimer();
     this.createTitleOverlay(container, !!saved);
     this.createReticle(container);
     this.createHint(container);
@@ -167,7 +185,7 @@ export class Game {
       ? 'Voxel World<br><span style="font-size:18px;font-weight:normal;opacity:0.85">World restored · F6 to reset</span>'
       : 'Voxel World';
     container.appendChild(this.titleElement);
-    this.titleStartTime = this.clock.getElapsedTime();
+    this.titleStartTime = this.clock.getElapsed();
   }
 
   private createReticle(container: HTMLElement) {
@@ -207,7 +225,7 @@ export class Game {
 
   private updateTitle() {
     if (this.titleElement) {
-      const elapsed = this.clock.getElapsedTime() - this.titleStartTime;
+      const elapsed = this.clock.getElapsed() - this.titleStartTime;
       if (elapsed > 2 && elapsed < 3) {
         this.titleElement.style.opacity = String(1 - (elapsed - 2));
       } else if (elapsed >= 3) {
@@ -248,6 +266,22 @@ export class Game {
     this.camera.add(this.viewModel.getObject());
   }
 
+  // Each handler mutates state and returns the toast message to show.
+  private readonly fnKeyHandlers: Record<string, () => string> = {
+    F3: () => {
+      this.debugWireframe = !this.debugWireframe;
+      this.worldGenerator.setWireframe(this.debugWireframe);
+      return `Wireframe: ${this.debugWireframe ? 'on' : 'off'}`;
+    },
+    F6: () => { this.resetWorld(); return 'World reset'; },
+    F7: () => { this.skySystem.setTimeOfDay(0.3); return 'Time: morning'; },
+    F8: () => {
+      this.grassVisible = !this.grassVisible;
+      this.grassSystem.setVisible(this.grassVisible);
+      return `Grass: ${this.grassVisible ? 'on' : 'off'}`;
+    },
+  };
+
   private setupControls() {
     window.addEventListener('keydown', (event) => {
       // Number keys select hotbar slots.
@@ -264,15 +298,10 @@ export class Game {
         event.preventDefault();
         return;
       }
-      if (event.code === 'F3') {
+      const fnHandler = this.fnKeyHandlers[event.code];
+      if (fnHandler) {
         event.preventDefault();
-        this.debugWireframe = !this.debugWireframe;
-        this.worldGenerator.setWireframe(this.debugWireframe);
-        return;
-      }
-      if (event.code === 'F6') {
-        event.preventDefault();
-        this.resetWorld();
+        this.showToast(fnHandler());
         return;
       }
       this.keyStates[event.code] = true;
@@ -307,6 +336,74 @@ export class Game {
       this.inventory.cycle(event.deltaY > 0 ? 1 : -1);
       event.preventDefault();
     }, { passive: false });
+  }
+
+  private setupToast(container: HTMLElement) {
+    const toast = document.createElement('div');
+    toast.style.position = 'absolute';
+    toast.style.top = '60px';
+    toast.style.left = '50%';
+    toast.style.transform = 'translateX(-50%)';
+    toast.style.padding = '8px 16px';
+    toast.style.background = 'rgba(0, 0, 0, 0.78)';
+    toast.style.color = 'white';
+    toast.style.font = '600 14px/1.2 Arial, sans-serif';
+    toast.style.borderRadius = '6px';
+    toast.style.opacity = '0';
+    toast.style.transition = 'opacity 0.2s';
+    toast.style.pointerEvents = 'none';
+    toast.style.zIndex = '50';
+    toast.style.whiteSpace = 'nowrap';
+    container.appendChild(toast);
+    this.toastElement = toast;
+  }
+
+  private showToast(message: string) {
+    this.toastElement.textContent = message;
+    this.toastElement.style.opacity = '1';
+    if (this.toastTimeoutId !== null) window.clearTimeout(this.toastTimeoutId);
+    this.toastTimeoutId = window.setTimeout(() => {
+      this.toastElement.style.opacity = '0';
+      this.toastTimeoutId = null;
+    }, 1200);
+  }
+
+  // EXT_disjoint_timer_query_webgl2 gives us true GPU time for the render
+  // pass, as opposed to the CPU-dispatch bracket around renderer.render().
+  // Results come back a few frames late — we keep a small in-flight queue and
+  // poll availability each frame. Chrome currently only exposes this when
+  // chrome://flags/#enable-webgl-developer-extensions is on.
+  private setupGpuTimer() {
+    const gl = this.renderer.getContext();
+    if (!(gl instanceof WebGL2RenderingContext)) return;
+    const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2') as
+      | { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number }
+      | null;
+    if (!ext) return;
+    this.timerExt = ext;
+  }
+
+  private pollGpuTimerQueries() {
+    const ext = this.timerExt;
+    if (!ext) return;
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    // GPU_DISJOINT_EXT means the driver aborted the pipeline; any in-flight
+    // results are garbage — drop them and move on.
+    if (gl.getParameter(ext.GPU_DISJOINT_EXT)) {
+      for (const q of this.pendingGpuQueries) gl.deleteQuery(q);
+      this.pendingGpuQueries.length = 0;
+      return;
+    }
+    while (this.pendingGpuQueries.length > 0) {
+      const q = this.pendingGpuQueries[0];
+      const available = gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE) as boolean;
+      if (!available) break;
+      const ns = gl.getQueryParameter(q, gl.QUERY_RESULT) as number;
+      gl.deleteQuery(q);
+      this.pendingGpuQueries.shift();
+      const ms = ns / 1_000_000;
+      this.debugValues.gpuRenderMs = this.debugValues.gpuRenderMs * 0.9 + ms * 0.1;
+    }
   }
 
   private updateCamera() {
@@ -350,8 +447,14 @@ export class Game {
     this.debugPane.addBinding(this.debugValues, 'fps', {
       readonly: true, label: 'FPS', format: (v: number) => v.toFixed(0),
     });
+    // "Render dispatch" is the CPU time spent in renderer.render() queuing
+    // GL commands; "GPU render" is the actual shading time from
+    // EXT_disjoint_timer_query_webgl2 (stays at 0 if the extension is absent).
     this.debugPane.addBinding(this.debugValues, 'renderMs', {
-      readonly: true, label: 'Render', format: (v: number) => v.toFixed(2) + ' ms',
+      readonly: true, label: 'Render dispatch', format: (v: number) => v.toFixed(2) + ' ms',
+    });
+    this.debugPane.addBinding(this.debugValues, 'gpuRenderMs', {
+      readonly: true, label: 'GPU render', format: (v: number) => v.toFixed(2) + ' ms',
     });
     this.debugPane.addBinding(this.debugValues, 'triangles', {
       readonly: true, label: 'Triangles', format: (v: number) => v.toLocaleString(),
@@ -807,11 +910,11 @@ export class Game {
   private debugWireframe = false;
 
   public animate() {
-    if (!this.animationStarted) {
-      this.clock.getDelta();
-      this.animationStarted = true;
-    }
-    const deltaTime = Math.min(this.clock.getDelta(), 0.05);
+    this.clock.update();
+    // Discard the first delta (it spans construction → first frame).
+    const wasFirstFrame = !this.animationStarted;
+    this.animationStarted = true;
+    const deltaTime = wasFirstFrame ? 0 : Math.min(this.clock.getDelta(), 0.05);
 
     this.updateTitle();
 
@@ -854,10 +957,19 @@ export class Game {
     this.debugValues.farChunks = this.farChunks.size;
 
     const renderStart = performance.now();
+    const ext = this.timerExt;
+    const gl = ext ? (this.renderer.getContext() as WebGL2RenderingContext) : null;
+    const query = gl ? gl.createQuery() : null;
+    if (ext && gl && query) gl.beginQuery(ext.TIME_ELAPSED_EXT, query);
     this.renderer.render(this.scene, this.camera);
+    if (ext && gl && query) {
+      gl.endQuery(ext.TIME_ELAPSED_EXT);
+      this.pendingGpuQueries.push(query);
+    }
     const renderMs = performance.now() - renderStart;
-    // Smooth render time so the readout doesn't flicker frame-to-frame.
+    // Smooth CPU dispatch time so the readout doesn't flicker frame-to-frame.
     this.debugValues.renderMs = this.debugValues.renderMs * 0.9 + renderMs * 0.1;
+    this.pollGpuTimerQueries();
     this.debugValues.triangles = this.renderer.info.render.triangles;
     this.debugValues.drawCalls = this.renderer.info.render.calls;
     this.debugValues.geometries = this.renderer.info.memory.geometries;
