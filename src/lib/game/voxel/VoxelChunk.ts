@@ -1,10 +1,20 @@
 import type { BlockId } from './BlockTypes';
 import { AIR, LEAVES, ROOF, WOOD } from './BlockTypes';
 
+// Face bit indices used by the flood-fill connectivity matrix.
+export const FACE_PX = 0;
+export const FACE_NX = 1;
+export const FACE_PY = 2;
+export const FACE_NY = 3;
+export const FACE_PZ = 4;
+export const FACE_NZ = 5;
+export const FACE_MASK_ALL = 0b111111;
+
 export class VoxelChunk {
   public readonly voxels: Uint8Array;
   private readonly heightMap: Int16Array;
   private lod1Cache: Uint8Array | null = null;
+  private connectivityCache: Uint8Array | null = null;
   public readonly lod1SizeX: number;
   public readonly lod1SizeY: number;
   public readonly lod1SizeZ: number;
@@ -33,6 +43,7 @@ export class VoxelChunk {
   public set(x: number, y: number, z: number, block: BlockId): void {
     this.voxels[this.idx(x, y, z)] = block;
     this.lod1Cache = null;
+    this.connectivityCache = null;
   }
 
   public getLOD1(x: number, y: number, z: number): BlockId {
@@ -92,5 +103,91 @@ export class VoxelChunk {
   public getHeight(x: number, z: number): number {
     if (x < 0 || z < 0 || x >= this.sizeX || z >= this.sizeZ) return 0;
     return this.heightMap[z * this.sizeX + x];
+  }
+
+  // Returns a 6-byte array where matrix[face] is a bitmask of faces that `face`
+  // can reach via connected AIR. Used for face flood-fill culling: to decide
+  // whether to visit a chunk's neighbor, the caller checks if the neighbor's
+  // "outgoing" face is connected to any of the faces we entered through.
+  public getConnectivity(): Uint8Array {
+    if (!this.connectivityCache) this.connectivityCache = this.computeConnectivity();
+    return this.connectivityCache;
+  }
+
+  private computeConnectivity(): Uint8Array {
+    const W = this.sizeX, H = this.sizeY, D = this.sizeZ;
+    const plane = W * D;
+    const matrix = new Uint8Array(6);
+    const visited = new Uint8Array(W * H * D);
+    const stack: number[] = [];
+
+    for (let y = 0; y < H; y++) {
+      for (let z = 0; z < D; z++) {
+        for (let x = 0; x < W; x++) {
+          const startIdx = (y * D + z) * W + x;
+          if (this.voxels[startIdx] !== AIR) continue;
+          if (visited[startIdx]) continue;
+
+          // Flood-fill this AIR region and gather the set of faces it touches.
+          let faceBits = 0;
+          stack.length = 0;
+          stack.push(startIdx);
+          visited[startIdx] = 1;
+
+          while (stack.length > 0) {
+            const idx = stack.pop()!;
+            const cy = (idx / plane) | 0;
+            const rem = idx - cy * plane;
+            const cz = (rem / W) | 0;
+            const cx = rem - cz * W;
+
+            if (cx === 0) faceBits |= 1 << FACE_NX;
+            if (cx === W - 1) faceBits |= 1 << FACE_PX;
+            if (cy === 0) faceBits |= 1 << FACE_NY;
+            if (cy === H - 1) faceBits |= 1 << FACE_PY;
+            if (cz === 0) faceBits |= 1 << FACE_NZ;
+            if (cz === D - 1) faceBits |= 1 << FACE_PZ;
+
+            // +X
+            if (cx + 1 < W) {
+              const n = idx + 1;
+              if (!visited[n] && this.voxels[n] === AIR) { visited[n] = 1; stack.push(n); }
+            }
+            // -X
+            if (cx > 0) {
+              const n = idx - 1;
+              if (!visited[n] && this.voxels[n] === AIR) { visited[n] = 1; stack.push(n); }
+            }
+            // +Y
+            if (cy + 1 < H) {
+              const n = idx + plane;
+              if (!visited[n] && this.voxels[n] === AIR) { visited[n] = 1; stack.push(n); }
+            }
+            // -Y
+            if (cy > 0) {
+              const n = idx - plane;
+              if (!visited[n] && this.voxels[n] === AIR) { visited[n] = 1; stack.push(n); }
+            }
+            // +Z
+            if (cz + 1 < D) {
+              const n = idx + W;
+              if (!visited[n] && this.voxels[n] === AIR) { visited[n] = 1; stack.push(n); }
+            }
+            // -Z
+            if (cz > 0) {
+              const n = idx - W;
+              if (!visited[n] && this.voxels[n] === AIR) { visited[n] = 1; stack.push(n); }
+            }
+          }
+
+          // Every face this region touches is mutually reachable through it.
+          for (let f = 0; f < 6; f++) {
+            if (faceBits & (1 << f)) matrix[f] |= faceBits;
+          }
+        }
+      }
+    }
+
+    return matrix;
   }
 }

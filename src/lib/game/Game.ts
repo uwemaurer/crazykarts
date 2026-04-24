@@ -14,6 +14,8 @@ import { AIR, BLOCK_TEXTURES, LEAVES, WOOD, type BlockId } from './voxel/BlockTy
 import { getTileTexture } from './voxel/TextureGenerator';
 import gsap from 'gsap';
 import { SaveManager, type SaveData, type SavedVillage } from './SaveManager';
+import { SkySystem } from './SkySystem';
+import { GrassSystem } from './GrassSystem';
 
 function randomPointAround(origin: THREE.Vector3, minRadius: number, maxRadius: number): THREE.Vector3 {
   const angle = Math.random() * Math.PI * 2;
@@ -69,6 +71,13 @@ export class Game {
   private debugPane!: TPane.Pane;
   private debugValues = {
     fps: 0,
+    renderMs: 0,
+    triangles: 0,
+    drawCalls: 0,
+    geometries: 0,
+    nearChunks: 0,
+    visibleNear: 0,
+    farChunks: 0,
     position: { x: 0, y: 0, z: 0 },
     yaw: 0,
     pitch: 0,
@@ -76,6 +85,9 @@ export class Game {
   };
 
   private sfx = new Sfx(0.45);
+  private skySystem!: SkySystem;
+  private grassSystem!: GrassSystem;
+  private playerLight!: THREE.PointLight;
   private wasGrounded = true;
 
   private worldGenerator: WorldGenerator;
@@ -106,6 +118,8 @@ export class Game {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.shadowMap.enabled = true;
+    // VSM gives soft, genuinely blurred shadows that don't crawl as the sun moves.
+    this.renderer.shadowMap.type = THREE.VSMShadowMap;
     this.canvas = this.renderer.domElement;
     container.appendChild(this.canvas);
 
@@ -204,31 +218,13 @@ export class Game {
   }
 
   private setupScene(saved: SaveData | null) {
-    const skyGeometry = new THREE.SphereGeometry(500, 60, 40);
-    const skyMaterial = new THREE.MeshBasicMaterial({
-      color: new THREE.Color(0x87CEEB),
-      side: THREE.BackSide,
-    });
-    const sky = new THREE.Mesh(skyGeometry, skyMaterial);
-    this.scene.add(sky);
+    this.skySystem = new SkySystem(this.scene, this.camera);
+    if (saved?.timeOfDay !== undefined) this.skySystem.setTimeOfDay(saved.timeOfDay);
+    this.grassSystem = new GrassSystem(this.scene, this.worldGenerator);
 
-    this.scene.fog = new THREE.Fog(0x87CEEB, 60, 180);
-
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
-    this.scene.add(ambientLight);
-
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
-    directionalLight.position.set(5, 5, 5);
-    directionalLight.castShadow = true;
-    directionalLight.shadow.mapSize.width = 2048;
-    directionalLight.shadow.mapSize.height = 2048;
-    directionalLight.shadow.camera.near = 0.5;
-    directionalLight.shadow.camera.far = 200;
-    directionalLight.shadow.camera.left = -80;
-    directionalLight.shadow.camera.right = 80;
-    directionalLight.shadow.camera.top = 80;
-    directionalLight.shadow.camera.bottom = -80;
-    this.scene.add(directionalLight);
+    // A warm torch-like glow that activates at night and follows the player.
+    this.playerLight = new THREE.PointLight(0xffcc88, 0, 14, 1.6);
+    this.scene.add(this.playerLight);
 
     this.initializeChunks();
 
@@ -350,9 +346,30 @@ export class Game {
       (window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768);
     if (isTouch) return;
 
-    this.debugPane = new TPane.Pane({ title: 'Debug', expanded: false });
+    this.debugPane = new TPane.Pane({ title: 'Debug', expanded: true });
     this.debugPane.addBinding(this.debugValues, 'fps', {
       readonly: true, label: 'FPS', format: (v: number) => v.toFixed(0),
+    });
+    this.debugPane.addBinding(this.debugValues, 'renderMs', {
+      readonly: true, label: 'Render', format: (v: number) => v.toFixed(2) + ' ms',
+    });
+    this.debugPane.addBinding(this.debugValues, 'triangles', {
+      readonly: true, label: 'Triangles', format: (v: number) => v.toLocaleString(),
+    });
+    this.debugPane.addBinding(this.debugValues, 'drawCalls', {
+      readonly: true, label: 'Draw calls', format: (v: number) => v.toFixed(0),
+    });
+    this.debugPane.addBinding(this.debugValues, 'geometries', {
+      readonly: true, label: 'Geometries', format: (v: number) => v.toFixed(0),
+    });
+    this.debugPane.addBinding(this.debugValues, 'nearChunks', {
+      readonly: true, label: 'Near chunks', format: (v: number) => v.toFixed(0),
+    });
+    this.debugPane.addBinding(this.debugValues, 'visibleNear', {
+      readonly: true, label: 'Visible near', format: (v: number) => v.toFixed(0),
+    });
+    this.debugPane.addBinding(this.debugValues, 'farChunks', {
+      readonly: true, label: 'Far chunks (LOD1)', format: (v: number) => v.toFixed(0),
     });
     const positionFolder = this.debugPane.addFolder({ title: 'Position', expanded: false });
     positionFolder.addBinding(this.debugValues.position, 'x', { readonly: true, format: (v: number) => v.toFixed(1) });
@@ -635,6 +652,7 @@ export class Game {
     const chunk = this.worldGenerator.generateChunk(chunkX, chunkZ);
     this.nearChunks.set(key, chunk);
     this.scene.add(chunk.mesh);
+    this.grassSystem?.addChunk(chunkX, chunkZ);
   }
 
   private unloadNearChunk(key: string) {
@@ -644,6 +662,7 @@ export class Game {
     this.nearChunks.delete(key);
     const [cx, cz] = key.split(',').map(Number);
     this.worldGenerator.disposeChunkFull(cx, cz);
+    this.grassSystem?.removeChunk(cx, cz);
   }
 
   private loadFarChunk(chunkX: number, chunkZ: number) {
@@ -716,6 +735,74 @@ export class Game {
     return `${x},${z}`;
   }
 
+  // Face indices match VoxelChunk: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
+  // Only +/-X and +/-Z move to a loaded neighbor chunk (we don't stack
+  // chunks vertically). +/-Y still participate as entry/exit faces in the
+  // seed chunk's 6-bit entry mask.
+  private static readonly FACE_DX = [1, -1, 0, 0, 0, 0];
+  private static readonly FACE_DZ = [0, 0, 0, 0, 1, -1];
+  private static readonly FACE_OPPOSITE = [1, 0, 3, 2, 5, 4];
+  private static readonly HORIZONTAL_FACES = [0, 1, 4, 5];
+
+  private updateVisibilityCulling() {
+    const chunkSize = this.worldGenerator.getChunkSize();
+    const playerCx = Math.floor(this.player.position.x / chunkSize);
+    const playerCz = Math.floor(this.player.position.z / chunkSize);
+    const seedKey = this.getChunkKey(playerCx, playerCz);
+
+    const entryFaces = new Map<string, number>();
+    const queue: Array<{ cx: number; cz: number; faces: number }> = [];
+
+    if (!this.nearChunks.has(seedKey)) {
+      // Player is standing on an unloaded chunk (edge case). Show everything.
+      for (const wc of this.nearChunks.values()) wc.mesh.visible = true;
+      this.debugValues.visibleNear = this.nearChunks.size;
+      return;
+    }
+
+    // Seed: we're inside the player's chunk, so all 6 faces count as entry.
+    entryFaces.set(seedKey, 0b111111);
+    queue.push({ cx: playerCx, cz: playerCz, faces: 0b111111 });
+
+    while (queue.length > 0) {
+      const { cx, cz, faces } = queue.shift()!;
+      const conn = this.worldGenerator.getChunkConnectivity(cx, cz);
+      if (!conn) continue;
+
+      for (const exitFace of Game.HORIZONTAL_FACES) {
+        // Can we reach this outgoing face from any of the entry faces?
+        let reachable = false;
+        for (let inFace = 0; inFace < 6; inFace++) {
+          if ((faces & (1 << inFace)) === 0) continue;
+          if ((conn[inFace] & (1 << exitFace)) !== 0) { reachable = true; break; }
+        }
+        if (!reachable) continue;
+
+        const ncx = cx + Game.FACE_DX[exitFace];
+        const ncz = cz + Game.FACE_DZ[exitFace];
+        const nKey = this.getChunkKey(ncx, ncz);
+        if (!this.nearChunks.has(nKey)) continue;
+
+        const newEntry = 1 << Game.FACE_OPPOSITE[exitFace];
+        const prev = entryFaces.get(nKey) ?? 0;
+        const merged = prev | newEntry;
+        if (merged === prev) continue;
+        entryFaces.set(nKey, merged);
+        queue.push({ cx: ncx, cz: ncz, faces: merged });
+      }
+    }
+
+    // Apply visibility. Far-ring chunks are never culled here — they stay on
+    // Three.js's default frustum culling.
+    let visibleCount = 0;
+    for (const [key, wc] of this.nearChunks) {
+      const visible = entryFaces.has(key);
+      wc.mesh.visible = visible;
+      if (visible) visibleCount++;
+    }
+    this.debugValues.visibleNear = visibleCount;
+  }
+
   private animationStarted = false;
   private debugWireframe = false;
 
@@ -735,7 +822,14 @@ export class Game {
     this.wasGrounded = this.player.grounded;
 
     this.updateCamera();
+    this.skySystem.advance(deltaTime);
+    this.skySystem.updateForCamera(this.camera);
+    this.grassSystem.update(deltaTime);
+    this.grassSystem.setSunDir(this.skySystem.getDirectionalLight().position);
+    this.playerLight.position.copy(this.player.eye);
+    this.playerLight.intensity = this.skySystem.getNightFactor() * 1.6;
     this.updateChunks();
+    this.updateVisibilityCulling();
     this.updateTargeted();
 
     this.updateAnimals(deltaTime);
@@ -748,7 +842,7 @@ export class Game {
     this.syncViewModel();
     this.updateHint();
 
-    // Debug values.
+    // Debug values (pre-render).
     this.debugValues.fps = 1 / deltaTime;
     this.debugValues.position.x = this.player.position.x;
     this.debugValues.position.y = this.player.position.y;
@@ -756,8 +850,17 @@ export class Game {
     this.debugValues.yaw = this.player.yaw;
     this.debugValues.pitch = this.player.pitch;
     this.debugValues.grounded = this.player.grounded;
+    this.debugValues.nearChunks = this.nearChunks.size;
+    this.debugValues.farChunks = this.farChunks.size;
 
+    const renderStart = performance.now();
     this.renderer.render(this.scene, this.camera);
+    const renderMs = performance.now() - renderStart;
+    // Smooth render time so the readout doesn't flicker frame-to-frame.
+    this.debugValues.renderMs = this.debugValues.renderMs * 0.9 + renderMs * 0.1;
+    this.debugValues.triangles = this.renderer.info.render.triangles;
+    this.debugValues.drawCalls = this.renderer.info.render.calls;
+    this.debugValues.geometries = this.renderer.info.memory.geometries;
     requestAnimationFrame(() => this.animate());
   }
 
@@ -812,6 +915,14 @@ export class Game {
     }
   }
 
+  private invalidateGrassAround(wx: number, wz: number) {
+    const chunkSize = this.worldGenerator.getChunkSize();
+    const cx = Math.floor(wx / chunkSize);
+    const cz = Math.floor(wz / chunkSize);
+    const key = this.getChunkKey(cx, cz);
+    if (this.nearChunks.has(key)) this.grassSystem.rebuildChunk(cx, cz);
+  }
+
   private syncViewModel() {
     const selected = this.inventory.getSelected();
     if (!selected) { this.viewModel.setKind('none'); return; }
@@ -851,6 +962,7 @@ export class Game {
     this.inventory.addBlock(block, 1);
     this.sfx.play('mine');
     this.viewModel.swing();
+    this.invalidateGrassAround(wx, wz);
   }
 
   private placementInFlight = 0;
@@ -921,6 +1033,7 @@ export class Game {
       const stillAir = this.worldGenerator.getBlock(wx, wy, wz) === AIR;
       if (stillAir) {
         this.worldGenerator.placeBlock(wx, wy, wz, block);
+        this.invalidateGrassAround(wx, wz);
       } else {
         // Target got filled by something else (villager); give the block back.
         this.inventory.addBlock(block, 1);
@@ -1055,6 +1168,7 @@ export class Game {
     const data: SaveData = {
       version: 1,
       seed: this.worldGenerator.getInputSeed(),
+      timeOfDay: this.skySystem.getTimeOfDay(),
       player: {
         x: this.player.position.x,
         y: this.player.position.y,

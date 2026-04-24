@@ -250,6 +250,15 @@ export class WorldGenerator {
     return new THREE.Vector3(v.x + FARM_OFFSET_X, v.floorY, v.z + FARM_OFFSET_Z);
   }
 
+  public getChunkConnectivity(cx: number, cz: number): Uint8Array | null {
+    const chunk = this.chunks.get(this.key(cx, cz));
+    return chunk ? chunk.getConnectivity() : null;
+  }
+
+  public getChunkVoxels(cx: number, cz: number): VoxelChunk | null {
+    return this.chunks.get(this.key(cx, cz)) ?? null;
+  }
+
   public getBlock(wx: number, wy: number, wz: number): BlockId {
     if (wy < 0 || wy >= CHUNK_H) return AIR;
     const cx = Math.floor(wx / CHUNK_W);

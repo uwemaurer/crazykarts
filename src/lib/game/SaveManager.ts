@@ -13,6 +13,7 @@ export interface SavedVillage {
 export interface SaveData {
   version: number;
   seed: number;
+  timeOfDay?: number;
   player: { x: number; y: number; z: number; yaw: number; pitch: number };
   inventory: SerializedInventory;
   diffs: WorldDiffs;
