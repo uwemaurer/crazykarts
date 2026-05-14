@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { AIR, getBlockTextures, type BlockId } from './BlockTypes';
+import { AIR, TEX_GRASS_SIDE, WATER, getBlockTextures, type BlockId } from './BlockTypes';
 
 const SHADE_TOP = 1.0;
 const SHADE_BOTTOM = 0.5;
@@ -9,21 +9,58 @@ const SHADE_Z = 0.66;
 const AO_BRIGHTNESS: readonly number[] = [1.0, 0.62, 0.38, 0.2];
 
 export type VoxelSampler = (x: number, y: number, z: number) => BlockId;
+// Horizontal flow vector per (x, z) column, ignoring y. Used only for water
+// surfaces in the shader; non-flowing cells return (0, 0). Quantised to 4
+// bits per component when encoded into the greedy-merge mask so cells with
+// different flow directions don't merge into one quad.
+export type FlowSampler = (x: number, z: number) => readonly [number, number];
+// Per-voxel "is this cell reachable by direct skylight". Queried at the
+// air-side neighbour of each emitted face so cave faces (where the air cell
+// is sealed below ground) get aSkyLit=0 in the shader.
+export type SkyOpenSampler = (x: number, y: number, z: number) => number;
+
+// Discrete tile classification for water top faces. Picked per cell from the
+// pattern of cardinal water neighbours so the river outline threads cleanly
+// between cells, anti-aliased like a vector line. 0 = full water (all
+// four neighbours water, opposite-pair pass-through, ≤1 neighbour, or
+// T-junction). 1–4 = one of four diagonal half-tiles, named by which
+// quadrant of the cell holds water.
+const WATER_TILE_FULL = 0;
+const WATER_TILE_NE = 1;
+const WATER_TILE_SE = 2;
+const WATER_TILE_SW = 3;
+const WATER_TILE_NW = 4;
 
 function vertexAO(side1: number, side2: number, corner: number): number {
   if (side1 && side2) return 3;
   return side1 + side2 + corner;
 }
 
+// Quantise a flow component from [-1, 1] to a 4-bit unsigned index [0, 15].
+// Centre (7) represents zero; the mask encoder packs two of these side by
+// side so "no flow" is the same value everywhere and greedy-merges freely.
+function quantFlow(v: number): number {
+  const q = Math.round(v * 7 + 7);
+  return Math.max(0, Math.min(15, q));
+}
+function unquantFlow(q: number): number {
+  return (q - 7) / 7;
+}
+
 export function buildChunkGeometry(
   getVoxel: VoxelSampler,
   dims: [number, number, number],
+  getFlow?: FlowSampler,
+  getSkyOpen?: SkyOpenSampler,
 ): THREE.BufferGeometry | null {
   const positions: number[] = [];
   const normals: number[] = [];
   const colors: number[] = [];
   const uvs: number[] = [];
   const layers: number[] = [];
+  const flows: number[] = [];
+  const waterTiles: number[] = [];
+  const skies: number[] = [];
   const indices: number[] = [];
 
   const samplePos: [number, number, number] = [0, 0, 0];
@@ -73,7 +110,54 @@ export function buildChunkGeometry(
           const ao2 = vertexAO(sPu, sPv, cPP);
           const ao3 = vertexAO(sNu, sPv, cNP);
 
-          const packed = block | (ao0 << 8) | (ao1 << 10) | (ao2 << 12) | (ao3 << 14);
+          // Flow lives at (x, z); sample at the block's column. When getFlow
+          // is unset or returns zero, qx=qz=7 → packedFlow=0x77 for every
+          // cell and greedy-merge works exactly as before.
+          let packedFlow = 0x77;
+          if (getFlow) {
+            // Use the block's own column (the one carrying the voxel).
+            const [fx, fz] = getFlow(x[0], x[2]);
+            packedFlow = quantFlow(fx) | (quantFlow(fz) << 4);
+          }
+
+          // Discrete water-tile classification for ALL faces of a WATER cell
+          // (top, bottom, sides). For top faces it drives the water/grass
+          // diagonal mask; for side faces it picks WATER_SIDE vs GRASS_SIDE
+          // textures so the cell's exposed walls match its top's geometry.
+          let waterTile = WATER_TILE_FULL;
+          if (block === WATER) {
+            // Water cell sits on the solid side. For positive faces (a-side),
+            // that's (x[0], x[1], x[2]); for negative faces (b-side), step
+            // forward by q.
+            const cx = positive ? x[0] : x[0] + q[0];
+            const cy = positive ? x[1] : x[1] + q[1];
+            const cz = positive ? x[2] : x[2] + q[2];
+            const wN = getVoxel(cx, cy, cz + 1) === WATER;
+            const wS = getVoxel(cx, cy, cz - 1) === WATER;
+            const wE = getVoxel(cx + 1, cy, cz) === WATER;
+            const wW = getVoxel(cx - 1, cy, cz) === WATER;
+            const count = (wN ? 1 : 0) + (wS ? 1 : 0) + (wE ? 1 : 0) + (wW ? 1 : 0);
+            if (count === 2 && !(wN && wS) && !(wE && wW)) {
+              if (wN && wE) waterTile = WATER_TILE_NE;
+              else if (wS && wE) waterTile = WATER_TILE_SE;
+              else if (wS && wW) waterTile = WATER_TILE_SW;
+              else if (wN && wW) waterTile = WATER_TILE_NW;
+            }
+          }
+
+          // Sky-access level (0/1/2) read at the AIR-side neighbour — the
+          // cell a viewer of this face sits in. Defaults to 2 (full sky)
+          // when no callback is provided so the unmodified mesher path
+          // doesn't accidentally darken anything.
+          let skyLevel = 2;
+          if (getSkyOpen) {
+            const ax = positive ? x[0] + q[0] : x[0];
+            const ay = positive ? x[1] + q[1] : x[1];
+            const az = positive ? x[2] + q[2] : x[2];
+            skyLevel = getSkyOpen(ax, ay, az);
+          }
+
+          const packed = block | (ao0 << 8) | (ao1 << 10) | (ao2 << 12) | (ao3 << 14) | (packedFlow << 16) | (waterTile << 24) | (skyLevel << 27);
           mask[n] = positive ? packed : -packed;
         }
       }
@@ -112,6 +196,11 @@ export function buildChunkGeometry(
           const ao1 = (absM >> 10) & 0x3;
           const ao2 = (absM >> 12) & 0x3;
           const ao3 = (absM >> 14) & 0x3;
+          const packedFlow = (absM >> 16) & 0xff;
+          const fxDecoded = unquantFlow(packedFlow & 0xf);
+          const fzDecoded = unquantFlow((packedFlow >> 4) & 0xf);
+          const waterTileDecoded = (absM >> 24) & 0x7;
+          const skyLitDecoded = (absM >> 27) & 0x3;
 
           const tex = getBlockTextures(block);
           let layer: number;
@@ -122,6 +211,25 @@ export function buildChunkGeometry(
           } else {
             layer = tex.side;
             shade = d === 0 ? SHADE_X : SHADE_Z;
+            // Half-tile water cells: vertical sides on the grass half of the
+            // diagonal show the bank (grass-on-dirt), not water. The N/E/S/W
+            // sides for each tile orientation are baked from the same diagonal
+            // that drives the top-face mask.
+            if (block === WATER && waterTileDecoded !== WATER_TILE_FULL) {
+              let isWaterSide = false;
+              if (d === 0) {
+                // d=0 ⇒ X-axis face. positive=+X (E face), negative=-X (W face).
+                isWaterSide = positive
+                  ? (waterTileDecoded === WATER_TILE_NE || waterTileDecoded === WATER_TILE_SE)
+                  : (waterTileDecoded === WATER_TILE_NW || waterTileDecoded === WATER_TILE_SW);
+              } else {
+                // d=2 ⇒ Z-axis face. positive=+Z (N face), negative=-Z (S face).
+                isWaterSide = positive
+                  ? (waterTileDecoded === WATER_TILE_NE || waterTileDecoded === WATER_TILE_NW)
+                  : (waterTileDecoded === WATER_TILE_SE || waterTileDecoded === WATER_TILE_SW);
+              }
+              if (!isWaterSide) layer = TEX_GRASS_SIDE;
+            }
           }
 
           const g0 = shade * AO_BRIGHTNESS[ao0];
@@ -142,6 +250,9 @@ export function buildChunkGeometry(
           for (let k = 0; k < 4; k++) {
             normals.push(normal[0], normal[1], normal[2]);
             layers.push(layer);
+            flows.push(fxDecoded, fzDecoded);
+            waterTiles.push(waterTileDecoded);
+            skies.push(skyLitDecoded);
           }
           colors.push(g0, g0, g0, g1, g1, g1, g2, g2, g2, g3, g3, g3);
 
@@ -189,6 +300,9 @@ export function buildChunkGeometry(
   geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
   geometry.setAttribute('aLayer', new THREE.Float32BufferAttribute(layers, 1));
+  geometry.setAttribute('aFlow', new THREE.Float32BufferAttribute(flows, 2));
+  geometry.setAttribute('aWaterTile', new THREE.Float32BufferAttribute(waterTiles, 1));
+  geometry.setAttribute('aSkyLit', new THREE.Float32BufferAttribute(skies, 1));
   geometry.setIndex(indices);
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();

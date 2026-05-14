@@ -1,9 +1,9 @@
 import * as THREE from 'three';
-import { createNoise2D } from 'simplex-noise';
+import { createNoise2D, createNoise3D } from 'simplex-noise';
 import { VoxelChunk } from './voxel/VoxelChunk';
 import { buildChunkGeometry } from './voxel/GreedyMesher';
-import { createBlockTextureArray, createChunkMaterial } from './voxel/TextureGenerator';
-import { AIR, DIRT, GRASS, LEAVES, ROAD, ROOF, SAND, SNOW, STONE, WOOD, type BlockId } from './voxel/BlockTypes';
+import { createBlockTextureArray, createChunkMaterial, createChunkSharedUniforms, createGrassTopTexture, type ChunkMaterial, type ChunkSharedUniforms } from './voxel/TextureGenerator';
+import { AIR, COAL_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES, MOSS_GRASS, ROAD, ROOF, SAND, SNOW, STONE, WATER, WOOD, type BlockId } from './voxel/BlockTypes';
 
 export interface WorldChunk {
   mesh: THREE.Group;
@@ -18,6 +18,43 @@ const SNOW_LINE = 22;
 const BASE_HEIGHT = 14;
 const HEIGHT_AMP = 10;
 const TREE_CHANCE = 0.007;
+// River carving. The field value is a smooth noise offset from the terrain
+// noise; cells where |value| falls below this threshold become a river (the
+// zero-crossings of a low-freq noise trace natural-looking curves). Narrower
+// threshold = thinner rivers. Frequency controls winding scale.
+const RIVER_NOISE_FREQ = 0.012;
+const RIVER_BAND_WIDTH = 0.035;
+
+// Cave carving. Two-octave 3D simplex defines chambers; threshold-crossing
+// cells become AIR. Surface attenuation smoothstep keeps openings rare in
+// the top 6 blocks. Walker corridors are sourced from anchor cells on a
+// 64-block global grid so any chunk can re-derive walkers passing through
+// it without per-chunk state.
+const CAVE_FREQ_LOW = 0.045;
+const CAVE_FREQ_HIGH = 0.09;
+const CAVE_AMP_LOW = 0.65;
+const CAVE_AMP_HIGH = 0.35;
+const CAVE_THRESHOLD = 0.55;
+const CAVE_SURFACE_FADE_NEAR = 2;
+const CAVE_SURFACE_FADE_FAR = 6;
+const WALKER_ANCHOR_GRID = 64;
+const WALKER_SPAWN_PROB = 0.4;
+const WALKER_LEN_MIN = 80;
+const WALKER_LEN_MAX = 140;
+const WALKER_RADIUS_MIN = 1.5;
+const WALKER_RADIUS_MAX = 2.5;
+
+// Ore noise. Single-octave 3D simplex per ore (offset to decorrelate). Higher
+// freq = smaller, more numerous veins. Higher threshold = sparser. Y-band
+// caps placement to a depth window; gold deepest, coal everywhere.
+const ORE_GOLD_FREQ = 0.22;
+const ORE_GOLD_THRESHOLD = 0.72;
+const ORE_GOLD_DEPTH_MIN = 14;
+const ORE_IRON_FREQ = 0.20;
+const ORE_IRON_THRESHOLD = 0.62;
+const ORE_IRON_DEPTH_MIN = 8;
+const ORE_COAL_FREQ = 0.18;
+const ORE_COAL_THRESHOLD = 0.55;
 
 const REGION_CHUNKS = 4;
 const REGION_W = REGION_CHUNKS * CHUNK_W;
@@ -69,24 +106,66 @@ function deterministicRandom(x: number, z: number, seed: number): number {
   return ((h ^ (h >>> 16)) >>> 0) / 0xffffffff;
 }
 
+// Hermite smoothstep matching GLSL semantics — used by cave depth attenuation.
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
 export type WorldDiffs = Record<string, Array<[number, number, number, number]>>;
 
 export class WorldGenerator {
   private readonly noise2D: (x: number, y: number) => number;
+  private readonly noise3D: (x: number, y: number, z: number) => number;
   private readonly chunks = new Map<string, VoxelChunk>();
   private readonly chunkGroups = new Map<string, THREE.Group>();
   private readonly chunkGroupsLOD1 = new Map<string, THREE.Group>();
-  private readonly chunkMaterial: THREE.Material;
+  private readonly chunkMaterial: ChunkMaterial;     // near (full LOD)
+  private readonly chunkMaterialFar: ChunkMaterial;  // LOD1
+  private readonly chunkSharedUniforms: ChunkSharedUniforms;
   private readonly seed: number;
   private readonly inputSeed: number;
   // Per-chunk overrides: chunkKey -> "lx,ly,lz" -> blockId. Last-write-wins dedup.
   private readonly mods = new Map<string, Map<string, BlockId>>();
 
-  constructor(seed: number = Math.random()) {
+  constructor(seed: number = Math.random(), renderer?: THREE.WebGLRenderer) {
     this.inputSeed = seed;
     this.seed = Math.floor(seed * 2 ** 31);
     this.noise2D = createNoise2D(() => seed);
-    this.chunkMaterial = createChunkMaterial(createBlockTextureArray());
+    // Distinct 3D noise for caves + ores. Using a different seed function so
+    // the two fields don't correlate with each other or with terrain.
+    this.noise3D = createNoise3D(() => (seed * 0.7919) % 1);
+    const atlas = createBlockTextureArray(renderer);
+    const grassTex = createGrassTopTexture(renderer);
+    this.chunkSharedUniforms = createChunkSharedUniforms();
+    this.chunkMaterial = createChunkMaterial(atlas, grassTex, 0, this.chunkSharedUniforms);
+    this.chunkMaterialFar = createChunkMaterial(atlas, grassTex, 1, this.chunkSharedUniforms);
+    // LOD1 is the backdrop: always rendered (no discard), drawn first
+    // (renderOrder=-1 on the mesh). Depth ordering is handled by the
+    // -1-voxel y-shift on the LOD1 chunk group (see generateChunkLOD1)
+    // — LOD1's surface sits at-or-below LOD0's, so LOD0 wins the depth
+    // test naturally where it has geometry. polygonOffset wasn't enough
+    // because it works in NDC depth (~ULPs) while the silhouette
+    // mismatch is in world coordinates, requiring a much bigger push at
+    // close distance than at far.
+  }
+
+  // Set by Game.ts each frame so the dithered fade in the chunk shader
+  // can compute distance from the camera. Coordinates are voxel-space
+  // (same space as vWorldXZ in the shader). uFadeStart / uFadeEnd are
+  // configured by setLodFadeRange.
+  public setCameraXZ(x: number, z: number): void {
+    this.chunkSharedUniforms.uCameraXZ.value.set(x, z);
+  }
+
+  public setLodFadeRange(startVoxels: number, endVoxels: number): void {
+    this.chunkSharedUniforms.uFadeStart.value = startVoxels;
+    this.chunkSharedUniforms.uFadeEnd.value = endVoxels;
+  }
+
+  /** Bit 0 = disable LOD0 dither discard, bit 1 = visualise fade gradient. */
+  public setLodDebugMode(mode: number): void {
+    this.chunkSharedUniforms.uDebugMode.value = mode | 0;
   }
 
   public getInputSeed(): number {
@@ -98,7 +177,14 @@ export class WorldGenerator {
   }
 
   public setWireframe(enabled: boolean): void {
-    (this.chunkMaterial as THREE.MeshLambertMaterial).wireframe = enabled;
+    this.chunkMaterial.wireframe = enabled;
+    this.chunkMaterialFar.wireframe = enabled;
+  }
+
+  public advanceTime(deltaTime: number): void {
+    // uTime is shared across the two materials, so this single update
+    // moves both LOD tiers' water animations in lockstep.
+    this.chunkSharedUniforms.uTime.value += deltaTime;
   }
 
   public getHeightAt(worldX: number, worldZ: number): number {
@@ -135,7 +221,15 @@ export class WorldGenerator {
     let group = this.chunkGroupsLOD1.get(key);
     if (!group) {
       group = new THREE.Group();
-      group.position.set(chunkX * CHUNK_W, 0, chunkZ * CHUNK_W);
+      // Shift LOD1 down by 1 voxel in world Y. LOD1 cells span 2 voxels
+      // in y (because the LOD picks topmost solid in 2x2x2), so without
+      // the shift the silhouette can sit up to 1 voxel above LOD0's
+      // actual top face. From overhead that taller silhouette wins the
+      // depth test and entirely occludes LOD0, hiding the dither fade.
+      // Shifting LOD1 down by 1 voxel guarantees its surface is at-or-
+      // below LOD0's, so LOD0 always wins where it has geometry; LOD1
+      // only shows through where LOD0 dither-discards.
+      group.position.set(chunkX * CHUNK_W, -1, chunkZ * CHUNK_W);
       // The LOD mesh is built in half-unit voxel coords (16x24x16);
       // scale the group so it covers the same 32x48x32 world footprint.
       group.scale.set(2, 2, 2);
@@ -270,6 +364,20 @@ export class WorldGenerator {
     return chunk.get(lx, wy, lz);
   }
 
+  // Sky-access level at a world cell. 2 = full sky, 1 = under leaves/water,
+  // 0 = sealed under solid (cave). Used by Game.ts to switch on the player's
+  // headlamp when the player enters a cave.
+  public getSkyOpenAt(wx: number, wy: number, wz: number): number {
+    if (wy < 0 || wy >= CHUNK_H) return 2;
+    const cx = Math.floor(wx / CHUNK_W);
+    const cz = Math.floor(wz / CHUNK_W);
+    const chunk = this.chunks.get(this.key(cx, cz));
+    if (!chunk) return 2;
+    const lx = wx - cx * CHUNK_W;
+    const lz = wz - cz * CHUNK_W;
+    return chunk.getSkyOpen(lx, wy, lz);
+  }
+
   public raycastBlock(
     origin: THREE.Vector3,
     direction: THREE.Vector3,
@@ -336,6 +444,7 @@ export class WorldGenerator {
     if (chunk.get(lx, wy, lz) === block) return true;
     chunk.set(lx, wy, lz, block);
     this.recordMod(cx, cz, lx, wy, lz, block);
+    chunk.computeSkyOpen();
     chunk.computeHeightMap();
     this.rebuildChunkMeshes(cx, cz, chunk);
 
@@ -378,7 +487,9 @@ export class WorldGenerator {
     if (topY < SEA_LEVEL) return { r: 52, g: 98, b: 160 };
 
     switch (topBlock) {
-      case GRASS:  return { r: 72, g: 136, b: 58 };
+      case GRASS:      return { r: 72, g: 136, b: 58 };
+      case MOSS_GRASS: return { r: 52, g: 112, b: 50 };
+      case WATER:      return { r: 52, g: 98, b: 160 };
       case DIRT:   return { r: 110, g: 78, b: 48 };
       case STONE:  return { r: 130, g: 130, b: 138 };
       case SAND:   return { r: 220, g: 200, b: 142 };
@@ -434,6 +545,7 @@ export class WorldGenerator {
     for (const key of affected) {
       const chunk = this.chunks.get(key);
       if (!chunk) continue;
+      chunk.computeSkyOpen();
       chunk.computeHeightMap();
       const [cx, cz] = key.split(',').map(Number);
       this.rebuildChunkMesh(cx, cz, chunk);
@@ -452,9 +564,13 @@ export class WorldGenerator {
     if (!chunk) {
       chunk = new VoxelChunk(CHUNK_W, CHUNK_H, CHUNK_W);
       this.fillTerrain(chunk, cx, cz);
+      this.carveCaves(chunk, cx, cz);
+      this.scatterOres(chunk, cx, cz);
+      this.carveRivers(chunk, cx, cz);
       this.scatterTrees(chunk, cx, cz);
       this.stampVillagesAndRoads(chunk, cx, cz);
       this.applyMods(chunk, cx, cz);
+      chunk.computeSkyOpen();
       chunk.computeHeightMap();
       this.chunks.set(k, chunk);
     }
@@ -538,8 +654,266 @@ export class WorldGenerator {
           }
           chunk.set(x, y, z, block);
         }
+        // Fill the space between terrain top and sea level with water — lakes
+        // and ocean. For h == SEA_LEVEL the surface is exactly at sea level
+        // (shore); for h > SEA_LEVEL the loop is skipped (terrain is dry).
+        if (h <= SEA_LEVEL) {
+          for (let y = h; y <= SEA_LEVEL; y++) chunk.set(x, y, z, WATER);
+        }
       }
     }
+  }
+
+  // Noise field whose zero-crossings trace river paths. Offset from the
+  // terrain-noise domain so rivers don't systematically follow ridges/valleys;
+  // they wander over the map independently. Returned value is [-1, 1].
+  private riverField(worldX: number, worldZ: number): number {
+    return this.noise2D(worldX * RIVER_NOISE_FREQ + 40000, worldZ * RIVER_NOISE_FREQ + 40000);
+  }
+
+  private isRiverCell(worldX: number, worldZ: number): boolean {
+    // Thin band around zero → river. Skip if too high (mountain) or too low
+    // (already ocean/lake): rivers only exist in the mid-elevation band.
+    const h = this.terrainHeight(worldX, worldZ);
+    if (h <= SEA_LEVEL || h >= SNOW_LINE - 2) return false;
+    return Math.abs(this.riverField(worldX, worldZ)) < RIVER_BAND_WIDTH;
+  }
+
+  private carveRivers(chunk: VoxelChunk, cx: number, cz: number): void {
+    const worldX0 = cx * CHUNK_W;
+    const worldZ0 = cz * CHUNK_W;
+    for (let x = 0; x < CHUNK_W; x++) {
+      for (let z = 0; z < CHUNK_W; z++) {
+        const wx = worldX0 + x;
+        const wz = worldZ0 + z;
+        if (!this.isRiverCell(wx, wz)) continue;
+
+        const h = this.terrainHeight(wx, wz);
+        // River sits one block below surrounding terrain and is one block deep.
+        // Channel bottom (h-2) is DIRT, water surface (h-1) is WATER, column
+        // above is AIR. Clears any existing top block placed by fillTerrain.
+        const waterY = h - 1;
+        const channelBed = h - 2;
+        if (channelBed >= 0 && channelBed < CHUNK_H) chunk.set(x, channelBed, z, DIRT);
+        if (waterY >= 0 && waterY < CHUNK_H) chunk.set(x, waterY, z, WATER);
+        // Any blocks placed at h-1 or above (e.g. the grass top) become AIR
+        // except the water block itself.
+        for (let y = waterY + 1; y < CHUNK_H; y++) {
+          if (chunk.get(x, y, z) !== AIR) chunk.set(x, y, z, AIR);
+        }
+
+        // Flow direction = -∇h (downhill). Central differences on terrain
+        // height at the two horizontal neighbours. Normalised so magnitude
+        // represents "steepness"; caller's quantisation clips anything > 1.
+        const hxp = this.terrainHeight(wx + 1, wz);
+        const hxn = this.terrainHeight(wx - 1, wz);
+        const hzp = this.terrainHeight(wx, wz + 1);
+        const hzn = this.terrainHeight(wx, wz - 1);
+        let fx = -(hxp - hxn) * 0.5;
+        let fz = -(hzp - hzn) * 0.5;
+        const mag = Math.hypot(fx, fz);
+        if (mag > 0.0001) {
+          // Rescale so typical slopes land near magnitude 1; clamp anything
+          // steeper. The scroll speed is multiplied by this in the shader.
+          const target = Math.min(1, mag / 1.5);
+          fx = (fx / mag) * target;
+          fz = (fz / mag) * target;
+        }
+        chunk.setFlow(x, z, fx, fz);
+      }
+    }
+  }
+
+  // 3D simplex chambers + walker-anchor corridors. Walkers are sourced from
+  // anchor cells on a global 64-block grid; any chunk regenerates by re-walking
+  // anchors in a 3-cell radius (covers max walker reach). Determinism falls
+  // out of the per-anchor hash + per-step deterministic noise.
+  private carveCaves(chunk: VoxelChunk, cx: number, cz: number): void {
+    const worldX0 = cx * CHUNK_W;
+    const worldZ0 = cz * CHUNK_W;
+    const villages = this.getVillagesNear(worldX0 + CHUNK_W / 2, worldZ0 + CHUNK_W / 2, CHUNK_W);
+
+    // ── Pass 1: simplex chambers ────────────────────────────────────────────
+    // For each cell that's currently solid below surface, sample two-octave
+    // 3D simplex; carve when value > threshold and we're deep enough that the
+    // surface attenuation lets us through.
+    for (let lx = 0; lx < CHUNK_W; lx++) {
+      for (let lz = 0; lz < CHUNK_W; lz++) {
+        const wx = worldX0 + lx;
+        const wz = worldZ0 + lz;
+        const h = this.terrainHeight(wx, wz);
+        // Skip cells under villages so houses don't sit on voids.
+        if (this.isUnderVillage(wx, wz, villages)) continue;
+        // y starts at 1 (bedrock = y=0 stays). Caps at h-1 so we never
+        // accidentally carve the topsoil into a hole; openings are made by
+        // walker pass instead.
+        const yMax = Math.min(h - 1, CHUNK_H - 1);
+        for (let y = 1; y <= yMax; y++) {
+          const cur = chunk.get(lx, y, lz);
+          if (cur === AIR || cur === WATER) continue;
+          const fade = smoothstep(CAVE_SURFACE_FADE_NEAR, CAVE_SURFACE_FADE_FAR, h - y);
+          if (fade <= 0) continue;
+          const noiseLow = this.noise3D(wx * CAVE_FREQ_LOW, y * CAVE_FREQ_LOW, wz * CAVE_FREQ_LOW);
+          const noiseHigh = this.noise3D(wx * CAVE_FREQ_HIGH, y * CAVE_FREQ_HIGH, wz * CAVE_FREQ_HIGH);
+          const combined = (noiseLow * CAVE_AMP_LOW + noiseHigh * CAVE_AMP_HIGH) * fade;
+          if (combined > CAVE_THRESHOLD) chunk.set(lx, y, lz, AIR);
+        }
+      }
+    }
+
+    // ── Pass 2: walker corridors ────────────────────────────────────────────
+    // Anchor cells live on a global 64-block grid in world-space. Walkers
+    // can roam up to WALKER_LEN_MAX blocks from their anchor, so any chunk's
+    // mesh must re-walk anchors within ceil(WALKER_LEN_MAX / 64) + 1 cells.
+    const reach = Math.ceil(WALKER_LEN_MAX / WALKER_ANCHOR_GRID) + 1;
+    const ax0 = Math.floor(worldX0 / WALKER_ANCHOR_GRID) - reach;
+    const ax1 = Math.floor((worldX0 + CHUNK_W) / WALKER_ANCHOR_GRID) + reach;
+    const az0 = Math.floor(worldZ0 / WALKER_ANCHOR_GRID) - reach;
+    const az1 = Math.floor((worldZ0 + CHUNK_W) / WALKER_ANCHOR_GRID) + reach;
+    for (let ax = ax0; ax <= ax1; ax++) {
+      for (let az = az0; az <= az1; az++) {
+        const spawnRoll = deterministicRandom(ax, az, this.seed ^ 0xCAFE);
+        if (spawnRoll > WALKER_SPAWN_PROB) continue;
+        this.simulateWalker(chunk, cx, cz, ax, az, villages);
+      }
+    }
+  }
+
+  // Walks a sphere-carving path starting at the anchor centre. All randomness
+  // is derived from (ax, az) hashes + the per-step noise2D so the same anchor
+  // always produces the same carve set, regardless of which chunk consumes it.
+  private simulateWalker(
+    chunk: VoxelChunk,
+    cx: number,
+    cz: number,
+    ax: number,
+    az: number,
+    villages: Village[],
+  ): void {
+    const worldX0 = cx * CHUNK_W;
+    const worldZ0 = cz * CHUNK_W;
+    const length = WALKER_LEN_MIN + Math.floor(deterministicRandom(ax, az, this.seed ^ 0xBEEF) * (WALKER_LEN_MAX - WALKER_LEN_MIN));
+    const radius = WALKER_RADIUS_MIN + deterministicRandom(ax, az, this.seed ^ 0xF00D) * (WALKER_RADIUS_MAX - WALKER_RADIUS_MIN);
+    const startY = 4 + Math.floor(deterministicRandom(ax, az, this.seed ^ 0xDEAD) * 8);
+
+    let wx = ax * WALKER_ANCHOR_GRID + WALKER_ANCHOR_GRID / 2;
+    let wz = az * WALKER_ANCHOR_GRID + WALKER_ANCHOR_GRID / 2;
+    let wy = startY;
+    // Initial direction from a noise gradient so neighbouring anchors don't
+    // all march in the same direction.
+    const initAng = this.noise2D(ax * 13 + 0.123, az * 17 + 0.456) * Math.PI * 2;
+    let dirX = Math.cos(initAng);
+    let dirZ = Math.sin(initAng);
+
+    const r2 = radius * radius;
+    const rCeil = Math.ceil(radius);
+
+    for (let step = 0; step < length; step++) {
+      // Wander: rotate direction by a small per-step noise sample. Unique
+      // (ax, az, step) triple → reproducible.
+      const rotN = this.noise2D(ax * 0.7 + step * 0.13, az * 0.7 - step * 0.11);
+      const rot = rotN * 0.4;
+      const cs = Math.cos(rot), sn = Math.sin(rot);
+      const ndX = dirX * cs - dirZ * sn;
+      const ndZ = dirX * sn + dirZ * cs;
+      dirX = ndX;
+      dirZ = ndZ;
+      // Vertical drift: bias downward early, neutral once below depth 6.
+      const downBias = wy > 6 ? -0.12 : 0;
+      const dyN = this.noise2D(ax * 0.31 - step * 0.07, az * 0.29 + step * 0.05) * 0.18;
+      wy = Math.max(1, Math.min(CHUNK_H - 4, wy + downBias + dyN));
+
+      wx += dirX;
+      wz += dirZ;
+
+      // Quick reject: walker centre too far from chunk bounds to ever hit.
+      if (wx < worldX0 - rCeil || wx >= worldX0 + CHUNK_W + rCeil) continue;
+      if (wz < worldZ0 - rCeil || wz >= worldZ0 + CHUNK_W + rCeil) continue;
+
+      // Skip cells under villages so the walker can't undermine houses.
+      if (this.isUnderVillage(wx, wz, villages)) continue;
+
+      // Carve a sphere of voxels around (wx, wy, wz) that fall in chunk bounds.
+      const yi = Math.floor(wy);
+      const x0 = Math.max(0, Math.floor(wx - rCeil) - worldX0);
+      const x1 = Math.min(CHUNK_W - 1, Math.ceil(wx + rCeil) - worldX0);
+      const z0 = Math.max(0, Math.floor(wz - rCeil) - worldZ0);
+      const z1 = Math.min(CHUNK_W - 1, Math.ceil(wz + rCeil) - worldZ0);
+      const y0 = Math.max(1, yi - rCeil);
+      const y1 = Math.min(CHUNK_H - 1, yi + rCeil);
+      for (let lx = x0; lx <= x1; lx++) {
+        for (let lz = z0; lz <= z1; lz++) {
+          for (let y = y0; y <= y1; y++) {
+            const dx = (worldX0 + lx + 0.5) - wx;
+            const dy = y + 0.5 - wy;
+            const dz = (worldZ0 + lz + 0.5) - wz;
+            if (dx * dx + dy * dy + dz * dz > r2) continue;
+            const cur = chunk.get(lx, y, lz);
+            if (cur === AIR || cur === WATER) continue;
+            chunk.set(lx, y, lz, AIR);
+          }
+        }
+      }
+    }
+  }
+
+  // Conservative check: any village centre within VILLAGE_RADIUS+4 around
+  // (wx, wz). Used to keep cave carving from undermining village floors.
+  private isUnderVillage(wx: number, wz: number, villages: Village[]): boolean {
+    const guard = VILLAGE_RADIUS + 4;
+    for (const v of villages) {
+      const dx = wx - v.x, dz = wz - v.z;
+      if (dx * dx + dz * dz < guard * guard) return true;
+    }
+    return false;
+  }
+
+  // Three independent simplex queries (decorrelated by world-space offsets).
+  // Order: gold → iron → coal so deeper, rarer ores take precedence when
+  // multiple thresholds happen to fire at the same cell.
+  private scatterOres(chunk: VoxelChunk, cx: number, cz: number): void {
+    const worldX0 = cx * CHUNK_W;
+    const worldZ0 = cz * CHUNK_W;
+    for (let lx = 0; lx < CHUNK_W; lx++) {
+      for (let lz = 0; lz < CHUNK_W; lz++) {
+        const wx = worldX0 + lx;
+        const wz = worldZ0 + lz;
+        const h = this.terrainHeight(wx, wz);
+        const yMax = Math.min(h - 1, CHUNK_H - 1);
+        for (let y = 1; y <= yMax; y++) {
+          if (chunk.get(lx, y, lz) !== STONE) continue;
+
+          // Gold first (rarest), then iron, then coal.
+          if (y <= h - ORE_GOLD_DEPTH_MIN) {
+            const g = this.noise3D(wx * ORE_GOLD_FREQ + 30000, y * ORE_GOLD_FREQ, wz * ORE_GOLD_FREQ + 30000);
+            if (g > ORE_GOLD_THRESHOLD) { chunk.set(lx, y, lz, GOLD_ORE); continue; }
+          }
+          if (y <= h - ORE_IRON_DEPTH_MIN) {
+            const i = this.noise3D(wx * ORE_IRON_FREQ + 20000, y * ORE_IRON_FREQ, wz * ORE_IRON_FREQ);
+            if (i > ORE_IRON_THRESHOLD) { chunk.set(lx, y, lz, IRON_ORE); continue; }
+          }
+          const c = this.noise3D(wx * ORE_COAL_FREQ, y * ORE_COAL_FREQ, wz * ORE_COAL_FREQ);
+          if (c > ORE_COAL_THRESHOLD) { chunk.set(lx, y, lz, COAL_ORE); }
+        }
+      }
+    }
+  }
+
+  // Walks the actual generated chunk top-down to find the first solid block
+  // and returns one above it. Differs from terrainHeight when caves have
+  // hollowed the column or rivers carved through. Returns 0 if column is
+  // entirely AIR (shouldn't happen with bedrock floor).
+  public getSurfaceY(wx: number, wz: number): number {
+    const cx = Math.floor(wx / CHUNK_W);
+    const cz = Math.floor(wz / CHUNK_W);
+    const chunk = this.getOrGenerateChunk(cx, cz);
+    const lx = Math.floor(wx - cx * CHUNK_W);
+    const lz = Math.floor(wz - cz * CHUNK_W);
+    for (let y = CHUNK_H - 1; y >= 0; y--) {
+      const b = chunk.get(lx, y, lz);
+      if (b !== AIR && b !== WATER) return y + 1;
+    }
+    return 0;
   }
 
   private scatterTrees(chunk: VoxelChunk, cx: number, cz: number): void {
@@ -584,6 +958,26 @@ export class WorldGenerator {
     }
     const topY = crownBase + 2;
     if (topY < CHUNK_H && chunk.get(x, topY, z) === AIR) chunk.set(x, topY, z, LEAVES);
+
+    // Darker mossy grass in a small radius under the tree — looks more natural
+    // than the clean ground cut the stamping passes produce. Only recolours
+    // the current chunk; fringes of the radius that cross chunk borders stay
+    // regular GRASS (acceptable — the visual falloff hides the boundary).
+    const mossRadius = 3;
+    const topGrass = baseY - 1; // the grass cell the trunk sits on
+    for (let dx = -mossRadius; dx <= mossRadius; dx++) {
+      for (let dz = -mossRadius; dz <= mossRadius; dz++) {
+        const nx = x + dx;
+        const nz = z + dz;
+        if (nx < 0 || nx >= CHUNK_W || nz < 0 || nz >= CHUNK_W) continue;
+        // Rough circle with a jittered edge so it doesn't look like a disc.
+        const d2 = dx * dx + dz * dz;
+        const jitter = deterministicRandom(nx, nz, this.seed ^ 0xb055) * 1.6;
+        if (d2 > mossRadius * mossRadius - jitter) continue;
+        if (topGrass < 0 || topGrass >= CHUNK_H) continue;
+        if (chunk.get(nx, topGrass, nz) === GRASS) chunk.set(nx, topGrass, nz, MOSS_GRASS);
+      }
+    }
   }
 
   private getVillage(rx: number, rz: number): Village | null {
@@ -890,7 +1284,14 @@ export class WorldGenerator {
     const geometry = buildChunkGeometry(getVoxel, [w, h, d]);
     if (!geometry) return null;
 
-    const mesh = new THREE.Mesh(geometry, this.chunkMaterial);
+    // LOD1 acts as the always-on backdrop. renderOrder = -1 puts it before
+    // LOD0 in the opaque queue, so it paints first; LOD0 then overwrites
+    // it where its dither test keeps the pixel and lets LOD1 show through
+    // where LOD0 discards. Without this explicit ordering, three.js's
+    // default front-to-back sort can put LOD1 after LOD0 at similar
+    // depth and cover up the high-detail mesh.
+    const mesh = new THREE.Mesh(geometry, this.chunkMaterialFar);
+    mesh.renderOrder = -1;
     mesh.castShadow = false;
     mesh.receiveShadow = true;
     return mesh;
@@ -918,7 +1319,51 @@ export class WorldGenerator {
       return chunk.get(x, y, z);
     };
 
-    const geometry = buildChunkGeometry(getVoxel, [CHUNK_W, CHUNK_H, CHUNK_W]);
+    const getFlow = (lx: number, lz: number): readonly [number, number] => {
+      if (lx < 0) {
+        const n = this.chunks.get(this.key(cx - 1, cz));
+        return n ? [n.getFlowX(CHUNK_W - 1, lz), n.getFlowZ(CHUNK_W - 1, lz)] : [0, 0];
+      }
+      if (lx >= CHUNK_W) {
+        const n = this.chunks.get(this.key(cx + 1, cz));
+        return n ? [n.getFlowX(0, lz), n.getFlowZ(0, lz)] : [0, 0];
+      }
+      if (lz < 0) {
+        const n = this.chunks.get(this.key(cx, cz - 1));
+        return n ? [n.getFlowX(lx, CHUNK_W - 1), n.getFlowZ(lx, CHUNK_W - 1)] : [0, 0];
+      }
+      if (lz >= CHUNK_W) {
+        const n = this.chunks.get(this.key(cx, cz + 1));
+        return n ? [n.getFlowX(lx, 0), n.getFlowZ(lx, 0)] : [0, 0];
+      }
+      return [chunk.getFlowX(lx, lz), chunk.getFlowZ(lx, lz)];
+    };
+
+    // Sky-occlusion sampler: out-of-bounds defaults to 1 (sky-lit) to match
+    // VoxelChunk.getSkyOpen — neighbour chunks may not be generated yet, and
+    // in that case the mesher should err on the side of "sky-lit" rather than
+    // dark-edge artifacts at chunk seams.
+    const getSkyOpen = (lx: number, ly: number, lz: number): number => {
+      if (lx < 0) {
+        const n = this.chunks.get(this.key(cx - 1, cz));
+        return n ? n.getSkyOpen(CHUNK_W - 1, ly, lz) : 1;
+      }
+      if (lx >= CHUNK_W) {
+        const n = this.chunks.get(this.key(cx + 1, cz));
+        return n ? n.getSkyOpen(0, ly, lz) : 1;
+      }
+      if (lz < 0) {
+        const n = this.chunks.get(this.key(cx, cz - 1));
+        return n ? n.getSkyOpen(lx, ly, CHUNK_W - 1) : 1;
+      }
+      if (lz >= CHUNK_W) {
+        const n = this.chunks.get(this.key(cx, cz + 1));
+        return n ? n.getSkyOpen(lx, ly, 0) : 1;
+      }
+      return chunk.getSkyOpen(lx, ly, lz);
+    };
+
+    const geometry = buildChunkGeometry(getVoxel, [CHUNK_W, CHUNK_H, CHUNK_W], getFlow, getSkyOpen);
     if (!geometry) return null;
 
     const mesh = new THREE.Mesh(geometry, this.chunkMaterial);

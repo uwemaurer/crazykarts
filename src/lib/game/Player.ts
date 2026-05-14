@@ -1,22 +1,35 @@
 import * as THREE from 'three';
 
-const EYE_HEIGHT = 1.6;
-const BODY_HEIGHT = 1.8;
-const BODY_RADIUS = 0.32;
-const WALK_SPEED = 5;
-const SPRINT_SPEED = 8;
-const JUMP_SPEED = 9;
-const GRAVITY = 24;
-const MAX_FALL_SPEED = 40;
-// Max height the player can automatically step up when walking into an obstacle.
-// 1.05 clears a single-block ledge with a tiny fudge factor.
-const STEP_UP_HEIGHT = 1.05;
+// All player-physics constants below are expressed in metric units (m, m/s,
+// m/s²). They run through `mToV` to convert into the voxel-space coordinates
+// the collision/integration code uses, where 1 voxel = METERS_PER_VOXEL m.
+// Change METERS_PER_VOXEL to keep the metric values intact while rescaling
+// the world — must match Game.WORLD_SCALE.
+// Temporarily reverted to 1 to bisect the LOD-fade artifact (see comment
+// in Game.ts WORLD_SCALE). Restore to 0.5 to re-enable half-metre blocks.
+const METERS_PER_VOXEL = 1.0;
+const mToV = (meters: number): number => meters / METERS_PER_VOXEL;
+
+const EYE_HEIGHT = mToV(1.6);       // human eye height
+const BODY_HEIGHT = mToV(1.8);      // standing height
+const BODY_RADIUS = mToV(0.32);     // shoulder half-width
+const WALK_SPEED = mToV(5);         // 5 m/s — brisk walk
+const SPRINT_SPEED = mToV(8);       // 8 m/s — slow jog
+const JUMP_SPEED = mToV(9);         // initial vertical velocity → ~1.7 m peak
+const GRAVITY = mToV(24);           // game-tuned, snappier than real 9.81 m/s²
+const MAX_FALL_SPEED = mToV(40);    // terminal velocity cap
+const STEP_UP_HEIGHT = mToV(1.05);  // auto-step a 1 m ledge with margin
+// Fly-mode movement. Faster than walking so you can survey terrain quickly,
+// noclip through everything, no gravity. Vertical via Space (up) / Q (down).
+const FLY_SPEED = mToV(15);
+const FLY_SPRINT_SPEED = mToV(35);
 
 export interface PlayerInput {
   forward: number; // -1..1
   strafe: number;  // -1..1
   jump: boolean;
   sprint: boolean;
+  descend?: boolean; // fly-mode only — pushes the camera down
 }
 
 export type IsSolid = (wx: number, wy: number, wz: number) => boolean;
@@ -28,6 +41,7 @@ export class Player {
   public pitch = 0;
   public grounded = false;
   public didJump = false;
+  public flyMode = false;
   public readonly eye = new THREE.Vector3();
   public readonly forward = new THREE.Vector3();
 
@@ -46,6 +60,11 @@ export class Player {
   }
 
   public update(deltaTime: number, input: PlayerInput, isSolid: IsSolid): void {
+    if (this.flyMode) {
+      this.updateFly(deltaTime, input);
+      return;
+    }
+
     const speed = input.sprint ? SPRINT_SPEED : WALK_SPEED;
 
     // Horizontal wish vector in world space from yaw.
@@ -77,6 +96,32 @@ export class Player {
     this.grounded = false;
     this.sweepAxis(1, this.velocity.y * deltaTime, isSolid);
 
+    this.updateDerived();
+  }
+
+  // No gravity, no collision. Horizontal movement uses yaw only (ignores
+  // pitch), so looking slightly down while flying forward keeps your
+  // altitude. Vertical movement comes purely from Space (up) / Q (down).
+  private updateFly(deltaTime: number, input: PlayerInput): void {
+    const speed = input.sprint ? FLY_SPRINT_SPEED : FLY_SPEED;
+    const fx = -Math.sin(this.yaw);
+    const fz = -Math.cos(this.yaw);
+    const rx = Math.cos(this.yaw);
+    const rz = -Math.sin(this.yaw);
+    let wishX = fx * input.forward + rx * input.strafe;
+    let wishZ = fz * input.forward + rz * input.strafe;
+    let wishY = 0;
+    if (input.jump) wishY += 1;
+    if (input.descend) wishY -= 1;
+    const mag = Math.hypot(wishX, wishY, wishZ);
+    if (mag > 1) { wishX /= mag; wishY /= mag; wishZ /= mag; }
+
+    this.velocity.set(wishX * speed, wishY * speed, wishZ * speed);
+    this.position.x += this.velocity.x * deltaTime;
+    this.position.y += this.velocity.y * deltaTime;
+    this.position.z += this.velocity.z * deltaTime;
+    this.grounded = false;
+    this.didJump = false;
     this.updateDerived();
   }
 

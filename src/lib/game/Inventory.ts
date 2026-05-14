@@ -1,5 +1,5 @@
 import type { BlockId } from './voxel/BlockTypes';
-import { DIRT, GRASS, LEAVES, ROAD, ROOF, SAND, SNOW, STONE, WOOD } from './voxel/BlockTypes';
+import { COAL_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES, ROAD, ROOF, SAND, SNOW, STONE, WOOD } from './voxel/BlockTypes';
 
 export type ToolKind = 'pickaxe' | 'axe';
 export type ItemKind = { kind: 'tool'; tool: ToolKind } | { kind: 'block'; block: BlockId };
@@ -22,27 +22,33 @@ const STACK_MAX = 99;
 const SLOT_COUNT = 9;
 
 const BLOCK_COLORS: Record<BlockId, string> = {
-  [GRASS]:  '#4a8a3a',
-  [DIRT]:   '#6e4e30',
-  [STONE]:  '#828289',
-  [SAND]:   '#dcc88e',
-  [WOOD]:   '#643c1c',
-  [LEAVES]: '#306e30',
-  [SNOW]:   '#eaf0f6',
-  [ROAD]:   '#bcbcc4',
-  [ROOF]:   '#b63e22',
+  [GRASS]:    '#4a8a3a',
+  [DIRT]:     '#6e4e30',
+  [STONE]:    '#828289',
+  [SAND]:     '#dcc88e',
+  [WOOD]:     '#643c1c',
+  [LEAVES]:   '#306e30',
+  [SNOW]:     '#eaf0f6',
+  [ROAD]:     '#bcbcc4',
+  [ROOF]:     '#b63e22',
+  [COAL_ORE]: '#2a2a2e',
+  [IRON_ORE]: '#a87a4a',
+  [GOLD_ORE]: '#f0c640',
 };
 
 const BLOCK_LABELS: Record<BlockId, string> = {
-  [GRASS]:  'Grass',
-  [DIRT]:   'Dirt',
-  [STONE]:  'Stone',
-  [SAND]:   'Sand',
-  [WOOD]:   'Wood',
-  [LEAVES]: 'Leaves',
-  [SNOW]:   'Snow',
-  [ROAD]:   'Road',
-  [ROOF]:   'Roof',
+  [GRASS]:    'Grass',
+  [DIRT]:     'Dirt',
+  [STONE]:    'Stone',
+  [SAND]:     'Sand',
+  [WOOD]:     'Wood',
+  [LEAVES]:   'Leaves',
+  [SNOW]:     'Snow',
+  [ROAD]:     'Road',
+  [ROOF]:     'Roof',
+  [COAL_ORE]: 'Coal Ore',
+  [IRON_ORE]: 'Iron Ore',
+  [GOLD_ORE]: 'Gold Ore',
 };
 
 export function blockColor(block: BlockId): string {

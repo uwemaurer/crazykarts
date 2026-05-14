@@ -16,6 +16,7 @@ import gsap from 'gsap';
 import { SaveManager, type SaveData, type SavedVillage } from './SaveManager';
 import { SkySystem } from './SkySystem';
 import { GrassSystem } from './GrassSystem';
+import { FrameStats } from './FrameStats';
 
 function randomPointAround(origin: THREE.Vector3, minRadius: number, maxRadius: number): THREE.Vector3 {
   const angle = Math.random() * Math.PI * 2;
@@ -70,9 +71,16 @@ export class Game {
   private titleStartTime = 0;
   private debugPane!: TPane.Pane;
   private debugValues = {
-    fps: 0,
-    renderMs: 0,     // CPU-side render dispatch (performance.now() around renderer.render)
-    gpuRenderMs: 0,  // GPU-side render time from EXT_disjoint_timer_query_webgl2 (0 if unsupported)
+    fps: 0,            // frames-in-window count (4 Hz refresh — text label)
+    frameMs: 0,        // latest frametime, updated every frame — graph source
+    frameMsAvg: 0,     // rolling 1 s mean (text label)
+    frameMsMax: 0,     // rolling 1 s worst frame (text label)
+    renderMs: 0,       // latest CPU dispatch, updated every frame — graph source
+    renderMsAvg: 0,    // rolling 1 s mean (text label)
+    renderMsMax: 0,    // rolling 1 s worst (text label)
+    gpuRenderMs: 0,    // latest GPU render result — graph source
+    gpuRenderMsAvg: 0, // rolling 1 s mean (text label)
+    gpuRenderMsMax: 0, // rolling 1 s worst (text label)
     triangles: 0,
     drawCalls: 0,
     geometries: 0,
@@ -84,6 +92,20 @@ export class Game {
     pitch: 0,
     grounded: false,
   };
+
+  // Rolling-window stats for the three timing metrics. 1-second window per
+  // the article's recommendation (https://vplesko.com/posts/how_to_implement_an_fps_counter.html).
+  // The text labels (fps / *Avg / *Max) are computed from these. The graph
+  // bindings plot the per-frame latest value (debugValues.frameMs etc.).
+  private frameTimeStats = new FrameStats(1.0);
+  private renderMsStats = new FrameStats(1.0);
+  private gpuRenderMsStats = new FrameStats(1.0);
+  // Display refresh rate is decoupled from sample rate: we record every
+  // frame but only flush text labels 4× per second so they stay readable.
+  // Tweakpane's own graph view samples its bound values on a separate
+  // `interval` schedule.
+  private debugPaneRefreshAt = 0;
+  private static readonly DEBUG_PANE_INTERVAL_S = 0.25;
 
   private sfx = new Sfx(0.45);
   private skySystem!: SkySystem;
@@ -109,8 +131,22 @@ export class Game {
   private savedVillageStates: Map<string, SavedVillage> = new Map();
   private saveIntervalId: number | null = null;
   private readonly SAVE_INTERVAL_MS = 15000;
-  private readonly RENDER_DISTANCE_NEAR = 4;
-  private readonly RENDER_DISTANCE_FAR = 10;
+  // More aggressive LOD: a smaller full-detail core, a 1-chunk overlap band
+  // where both LODs render with dithered cross-fade (so the transition is
+  // invisible), and a longer LOD1 horizon for distance perception.
+  // FADE_BAND_CHUNKS controls overlap thickness — fewer = sharper switch.
+  private readonly RENDER_DISTANCE_NEAR = 3;
+  private readonly RENDER_DISTANCE_FAR = 14;
+  private readonly FADE_BAND_CHUNKS = 1;
+  // LOD debug state (driven by tweakpane bindings). lodForceMode=0 shows
+  // both LODs normally; 1 hides LOD1 (near only); 2 hides LOD0 (far only).
+  // lodDebugMode is the bit-flag uniform: 1 = no dither, 2 = visualise.
+  private lodDebug = {
+    forceMode: 0,
+    debugMode: 0,
+    fadeStart: 0,
+    fadeEnd: 0,
+  };
   private minimapCanvas!: HTMLCanvasElement;
   private minimapCtx!: CanvasRenderingContext2D;
   private minimapImageData!: ImageData;
@@ -141,7 +177,18 @@ export class Game {
     // pause doesn't arrive as one giant frame step.
     this.clock.connect(document);
     const saved = SaveManager.load();
-    this.worldGenerator = new WorldGenerator(saved?.seed);
+    this.worldGenerator = new WorldGenerator(saved?.seed, this.renderer);
+    // Fade band — vWorldXZ in the chunk shader is post-worldRoot-scale
+    // (i.e. metres), so both the camera position and these thresholds are
+    // expressed in metres so the fade circle is actually centred on the
+    // player. Both LODs render in [start, end]; near-only inside start,
+    // far-only beyond.
+    const chunkW = this.worldGenerator.getChunkSize();
+    const chunkMetres = chunkW * Game.WORLD_SCALE;
+    this.worldGenerator.setLodFadeRange(
+      this.RENDER_DISTANCE_NEAR * chunkMetres,
+      (this.RENDER_DISTANCE_NEAR + this.FADE_BAND_CHUNKS) * chunkMetres,
+    );
     if (saved?.diffs) this.worldGenerator.loadDiffs(saved.diffs);
     if (saved?.villages) {
       for (const [k, v] of Object.entries(saved.villages)) {
@@ -235,10 +282,29 @@ export class Game {
     }
   }
 
+  // Each voxel is rendered at this many metres. Chunks, grass, water,
+  // animals, villagers, etc. all sit under `worldRoot` and get scaled
+  // uniformly; the camera and skybox stay in the scene root so the
+  // player's view ends up at the right relative height. Player-physics
+  // constants in Player.ts are expressed in metres and converted to
+  // voxel-space using the matching METERS_PER_VOXEL there — keep these
+  // two values in sync if you change either.
+  // Temporarily reverted to 1 to bisect the LOD-fade artifact: if the
+  // dithering glitch goes away at 1 m blocks, the bug is in the unit
+  // plumbing; if it persists, it's in the cross-fade logic. Set back to
+  // 0.5 (and METERS_PER_VOXEL in Player.ts to match) to restore the
+  // half-metre block experiment.
+  private static readonly WORLD_SCALE = 1.0;
+  private worldRoot!: THREE.Group;
+
   private setupScene(saved: SaveData | null) {
+    this.worldRoot = new THREE.Group();
+    this.worldRoot.scale.setScalar(Game.WORLD_SCALE);
+    this.scene.add(this.worldRoot);
+
     this.skySystem = new SkySystem(this.scene, this.camera);
     if (saved?.timeOfDay !== undefined) this.skySystem.setTimeOfDay(saved.timeOfDay);
-    this.grassSystem = new GrassSystem(this.scene, this.worldGenerator);
+    this.grassSystem = new GrassSystem(this.worldRoot, this.worldGenerator);
 
     // A warm torch-like glow that activates at night and follows the player.
     this.playerLight = new THREE.PointLight(0xffcc88, 0, 14, 1.6);
@@ -250,7 +316,16 @@ export class Game {
     if (saved?.player) {
       spawn = new THREE.Vector3(saved.player.x, saved.player.y, saved.player.z);
     } else {
-      spawn = new THREE.Vector3(0, this.worldGenerator.getHeightAt(0, 0), 0);
+      // Use the actual generated column top so we never drop into a cave that
+      // intersects (0,0). If the column at the origin somehow ends up entirely
+      // hollow, walk outward in +X until a solid spawn lands above sea level.
+      let sx = 0, sz = 0;
+      let sy = this.worldGenerator.getSurfaceY(0, 0);
+      for (let attempt = 0; sy < 5 && attempt < 8; attempt++) {
+        sx = (attempt + 1) * 4;
+        sy = this.worldGenerator.getSurfaceY(sx, sz);
+      }
+      spawn = new THREE.Vector3(sx, sy, sz);
     }
     this.player = new Player(spawn);
     if (saved?.player) {
@@ -259,9 +334,10 @@ export class Game {
     }
     this.player.applyToCamera(this.camera);
 
-    this.scene.add(this.highlight.getObject());
-    this.scene.add(this.placementGhost.getObject());
+    this.worldRoot.add(this.highlight.getObject());
+    this.worldRoot.add(this.placementGhost.getObject());
     // Camera must be in the scene graph for its children (viewmodel) to render.
+    // Stays in scene root (not worldRoot) so it doesn't get rescaled.
     this.scene.add(this.camera);
     this.camera.add(this.viewModel.getObject());
   }
@@ -273,6 +349,19 @@ export class Game {
       this.worldGenerator.setWireframe(this.debugWireframe);
       return `Wireframe: ${this.debugWireframe ? 'on' : 'off'}`;
     },
+    // G for fly. F5 isn't usable — Chrome and others reserve it as the
+    // browser-chrome reload shortcut and ignore JS preventDefault on it.
+    KeyG: () => {
+      this.player.flyMode = !this.player.flyMode;
+      if (this.player.flyMode) {
+        // Bump up to a survey altitude so you can immediately see the
+        // surrounding terrain without first hunting for the up key.
+        const groundY = this.worldGenerator.getHeightAt(this.player.position.x, this.player.position.z);
+        this.player.position.y = Math.max(this.player.position.y, groundY) + 18;
+        this.player.velocity.set(0, 0, 0);
+      }
+      return `Fly: ${this.player.flyMode ? 'on (Space=up, Q=down, Shift=fast)' : 'off'}`;
+    },
     F6: () => { this.resetWorld(); return 'World reset'; },
     F7: () => { this.skySystem.setTimeOfDay(0.3); return 'Time: morning'; },
     F8: () => {
@@ -283,6 +372,20 @@ export class Game {
   };
 
   private setupControls() {
+    // F-keys handled in CAPTURE phase so they fire before browser-default
+    // (F5 reload, F11 fullscreen, etc.) and before any DOM widget — e.g.
+    // Tweakpane's graph bindings, which sometimes swallow keydown when the
+    // pointer is over the debug pane. preventDefault here actually stops
+    // the browser refresh.
+    window.addEventListener('keydown', (event) => {
+      const fnHandler = this.fnKeyHandlers[event.code];
+      if (fnHandler) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.showToast(fnHandler());
+      }
+    }, { capture: true });
+
     window.addEventListener('keydown', (event) => {
       // Number keys select hotbar slots.
       if (event.code.startsWith('Digit')) {
@@ -296,12 +399,6 @@ export class Game {
       if (event.code === 'KeyE') {
         this.tryHelpBuild();
         event.preventDefault();
-        return;
-      }
-      const fnHandler = this.fnKeyHandlers[event.code];
-      if (fnHandler) {
-        event.preventDefault();
-        this.showToast(fnHandler());
         return;
       }
       this.keyStates[event.code] = true;
@@ -383,7 +480,7 @@ export class Game {
     this.timerExt = ext;
   }
 
-  private pollGpuTimerQueries() {
+  private pollGpuTimerQueries(nowSec: number) {
     const ext = this.timerExt;
     if (!ext) return;
     const gl = this.renderer.getContext() as WebGL2RenderingContext;
@@ -402,12 +499,23 @@ export class Game {
       gl.deleteQuery(q);
       this.pendingGpuQueries.shift();
       const ms = ns / 1_000_000;
-      this.debugValues.gpuRenderMs = this.debugValues.gpuRenderMs * 0.9 + ms * 0.1;
+      // Stamp with the resolve-time `nowSec` rather than the (unknown) GPU
+      // execution time. The 1-second window is wide enough that this
+      // 1-2-frame stamp lag is invisible.
+      this.gpuRenderMsStats.push(nowSec, ms);
+      // Latest value drives the graph view; the rolling stats drive the
+      // avg/worst labels.
+      this.debugValues.gpuRenderMs = ms;
     }
   }
 
   private updateCamera() {
     this.player.applyToCamera(this.camera);
+    // Camera lives in the un-scaled scene root; the world content lives
+    // under a `worldRoot` scaled by WORLD_SCALE. Scale the camera position
+    // here so the eye lands at the correct height relative to the
+    // shrunken world. (Rotation isn't affected by scale.)
+    this.camera.position.multiplyScalar(Game.WORLD_SCALE);
   }
 
   public setTouchInput(strafe: number, forward: number) {
@@ -435,6 +543,7 @@ export class Game {
       strafe,
       jump: !!this.keyStates['Space'],
       sprint: !!this.keyStates['ShiftLeft'] || !!this.keyStates['ShiftRight'],
+      descend: !!this.keyStates['KeyQ'],
     };
   }
 
@@ -444,17 +553,43 @@ export class Game {
     if (isTouch) return;
 
     this.debugPane = new TPane.Pane({ title: 'Debug', expanded: true });
+    // Each metric gets a graph (Tweakpane's built-in `view: 'graph'` plotting
+    // the per-frame latest value over time) plus three text labels: rolling-
+    // window FPS or mean, and worst frame in the window. The graph shows
+    // jitter and spikes; the text shows the precise aggregate values per
+    // the article's argument that FPS must aggregate, not be instantaneous.
+    this.debugPane.addBinding(this.debugValues, 'frameMs', {
+      readonly: true, label: 'Frame ms', view: 'graph', min: 0, max: 50, interval: 100,
+    });
     this.debugPane.addBinding(this.debugValues, 'fps', {
-      readonly: true, label: 'FPS', format: (v: number) => v.toFixed(0),
+      readonly: true, label: 'FPS (1s)', format: (v: number) => v.toFixed(0),
     });
-    // "Render dispatch" is the CPU time spent in renderer.render() queuing
-    // GL commands; "GPU render" is the actual shading time from
-    // EXT_disjoint_timer_query_webgl2 (stays at 0 if the extension is absent).
+    this.debugPane.addBinding(this.debugValues, 'frameMsAvg', {
+      readonly: true, label: '  avg', format: (v: number) => v.toFixed(2) + ' ms',
+    });
+    this.debugPane.addBinding(this.debugValues, 'frameMsMax', {
+      readonly: true, label: '  worst', format: (v: number) => v.toFixed(2) + ' ms',
+    });
+    // CPU dispatch — time spent in renderer.render() queuing GL commands.
     this.debugPane.addBinding(this.debugValues, 'renderMs', {
-      readonly: true, label: 'Render dispatch', format: (v: number) => v.toFixed(2) + ' ms',
+      readonly: true, label: 'Render dispatch', view: 'graph', min: 0, max: 30, interval: 100,
     });
+    this.debugPane.addBinding(this.debugValues, 'renderMsAvg', {
+      readonly: true, label: '  avg', format: (v: number) => v.toFixed(2) + ' ms',
+    });
+    this.debugPane.addBinding(this.debugValues, 'renderMsMax', {
+      readonly: true, label: '  worst', format: (v: number) => v.toFixed(2) + ' ms',
+    });
+    // GPU render — actual shading from EXT_disjoint_timer_query_webgl2.
+    // Stays at 0 if the extension isn't exposed by the browser/driver.
     this.debugPane.addBinding(this.debugValues, 'gpuRenderMs', {
-      readonly: true, label: 'GPU render', format: (v: number) => v.toFixed(2) + ' ms',
+      readonly: true, label: 'GPU render', view: 'graph', min: 0, max: 30, interval: 100,
+    });
+    this.debugPane.addBinding(this.debugValues, 'gpuRenderMsAvg', {
+      readonly: true, label: '  avg', format: (v: number) => v.toFixed(2) + ' ms',
+    });
+    this.debugPane.addBinding(this.debugValues, 'gpuRenderMsMax', {
+      readonly: true, label: '  worst', format: (v: number) => v.toFixed(2) + ' ms',
     });
     this.debugPane.addBinding(this.debugValues, 'triangles', {
       readonly: true, label: 'Triangles', format: (v: number) => v.toLocaleString(),
@@ -482,6 +617,33 @@ export class Game {
     this.debugPane.addBinding(this.debugValues, 'pitch', { readonly: true, format: (v: number) => (v * 180 / Math.PI).toFixed(0) + '°' });
     this.debugPane.addBinding(this.debugValues, 'grounded', { readonly: true });
 
+    // ── LOD debug folder ─────────────────────────────────────────────────
+    // Tools to diagnose the cross-fade. "Force LOD" toggles which meshes
+    // render so you can see each layer alone. "Visualise fade" tints by
+    // distance so you can see exactly where the fade engages in world
+    // space. "Disable dither" makes LOD0 fully opaque even past the fade
+    // start, so you can confirm the LOD0 mesh actually extends that far.
+    const chunkW = this.worldGenerator.getChunkSize();
+    this.lodDebug.fadeStart = this.RENDER_DISTANCE_NEAR * chunkW * Game.WORLD_SCALE;
+    this.lodDebug.fadeEnd = (this.RENDER_DISTANCE_NEAR + this.FADE_BAND_CHUNKS) * chunkW * Game.WORLD_SCALE;
+    const lodFolder = this.debugPane.addFolder({ title: 'LOD debug', expanded: false });
+    lodFolder.addBinding(this.lodDebug, 'forceMode', {
+      label: 'Show',
+      options: { Both: 0, 'LOD0 only (near)': 1, 'LOD1 only (far)': 2 },
+    }).on('change', () => this.applyLodForceMode());
+    lodFolder.addBinding(this.lodDebug, 'debugMode', {
+      label: 'Mode',
+      options: { Normal: 0, 'No dither': 1, 'Visualise fade': 2, 'No dither + visualise': 3 },
+    }).on('change', () => this.worldGenerator.setLodDebugMode(this.lodDebug.debugMode));
+    lodFolder.addBinding(this.lodDebug, 'fadeStart', {
+      label: 'Fade start',
+      min: 0, max: 500, step: 1,
+    }).on('change', () => this.worldGenerator.setLodFadeRange(this.lodDebug.fadeStart, this.lodDebug.fadeEnd));
+    lodFolder.addBinding(this.lodDebug, 'fadeEnd', {
+      label: 'Fade end',
+      min: 0, max: 500, step: 1,
+    }).on('change', () => this.worldGenerator.setLodFadeRange(this.lodDebug.fadeStart, this.lodDebug.fadeEnd));
+
     const element = this.debugPane.element;
     element.style.position = 'absolute';
     element.style.top = '10px';
@@ -498,7 +660,7 @@ export class Game {
         pos.y = getGroundY(pos.x, pos.z);
         const animal = factory(pos);
         this.animals.push(animal);
-        this.scene.add(animal.getGroup());
+        this.worldRoot.add(animal.getGroup());
       }
     };
 
@@ -590,7 +752,7 @@ export class Game {
       if (this.villagers.length >= this.MAX_VILLAGERS) break;
       const villager = new Villager(prof, home, ctx);
       this.villagers.push(villager);
-      this.scene.add(villager.getGroup());
+      this.worldRoot.add(villager.getGroup());
     }
   }
 
@@ -754,14 +916,15 @@ export class Game {
     if (this.nearChunks.has(key)) return;
     const chunk = this.worldGenerator.generateChunk(chunkX, chunkZ);
     this.nearChunks.set(key, chunk);
-    this.scene.add(chunk.mesh);
+    this.worldRoot.add(chunk.mesh);
+    if (this.lodDebug.forceMode === 2) chunk.mesh.visible = false;
     this.grassSystem?.addChunk(chunkX, chunkZ);
   }
 
   private unloadNearChunk(key: string) {
     const chunk = this.nearChunks.get(key);
     if (!chunk) return;
-    this.scene.remove(chunk.mesh);
+    this.worldRoot.remove(chunk.mesh);
     this.nearChunks.delete(key);
     const [cx, cz] = key.split(',').map(Number);
     this.worldGenerator.disposeChunkFull(cx, cz);
@@ -773,13 +936,14 @@ export class Game {
     if (this.farChunks.has(key)) return;
     const chunk = this.worldGenerator.generateChunkLOD1(chunkX, chunkZ);
     this.farChunks.set(key, chunk);
-    this.scene.add(chunk.mesh);
+    this.worldRoot.add(chunk.mesh);
+    if (this.lodDebug.forceMode === 1) chunk.mesh.visible = false;
   }
 
   private unloadFarChunk(key: string) {
     const chunk = this.farChunks.get(key);
     if (!chunk) return;
-    this.scene.remove(chunk.mesh);
+    this.worldRoot.remove(chunk.mesh);
     this.farChunks.delete(key);
     const [cx, cz] = key.split(',').map(Number);
     this.worldGenerator.disposeChunkLOD1(cx, cz);
@@ -798,6 +962,20 @@ export class Game {
     const wantedFar = new Set<string>();
     const farR = this.RENDER_DISTANCE_FAR;
     const nearR = this.RENDER_DISTANCE_NEAR;
+    const fadeBand = this.FADE_BAND_CHUNKS;
+    // Bands (Chebyshev chunk distance):
+    //   [0 .. nearR-1]      → only near loaded
+    //   [nearR-1 .. nearOuter+1]  → BOTH loaded (overlap, where the dither
+    //       fade engages). One chunk of slack on each side of the fade band
+    //       so fragments at chunk-distance boundaries always have both
+    //       LODs available — without this, the player walking to the edge
+    //       of their chunk shifts voxel distances enough that a fading
+    //       fragment can land in a chunk that only has one LOD loaded,
+    //       producing holes in the world.
+    //   (nearOuter+1 .. farR]      → only far loaded
+    const nearOuter = nearR + fadeBand;
+    const overlapInner = nearR;       // load far at this chunk-dist too
+    const overlapOuter = nearOuter;   // (already inclusive of fadeBand)
 
     for (let dx = -farR; dx <= farR; dx++) {
       for (let dz = -farR; dz <= farR; dz++) {
@@ -806,36 +984,71 @@ export class Game {
         const cx = currentChunkX + dx;
         const cz = currentChunkZ + dz;
         const key = this.getChunkKey(cx, cz);
-        if (dist <= nearR) wantedNear.add(key);
-        else wantedFar.add(key);
+        if (dist <= overlapOuter) wantedNear.add(key);
+        if (dist >= overlapInner) wantedFar.add(key);
       }
     }
 
-    // Unload near chunks that no longer belong in the near ring.
+    // Unload near chunks that no longer belong (outside the near+fade zone).
     for (const key of [...this.nearChunks.keys()]) {
       if (!wantedNear.has(key)) this.unloadNearChunk(key);
     }
-    // Promote/load near chunks.
-    for (const key of wantedNear) {
-      if (this.nearChunks.has(key)) continue;
-      if (this.farChunks.has(key)) this.unloadFarChunk(key);
-      const [cx, cz] = key.split(',').map(Number);
+    // Unload far chunks that are out of range. (Far chunks may legitimately
+    // coexist with near in the overlap band, so we no longer drop them just
+    // because a near chunk is loaded at the same key.)
+    for (const key of [...this.farChunks.keys()]) {
+      if (!wantedFar.has(key)) this.unloadFarChunk(key);
+    }
+
+    // Throttled loading: cap how many chunks we generate + mesh per frame
+    // and prioritise the closest ones. Without this, crossing a chunk
+    // boundary triggers a sync load of every missing chunk in one frame
+    // (~5-15 LOD0 + ~30 LOD1 chunks worst case), which blocks the render
+    // loop for hundreds of ms. Loading a couple per frame turns that into
+    // a barely-perceptible "ring drawn in" over the next ~½ second.
+    const loadList = (
+      wanted: Set<string>,
+      have: Map<string, unknown>,
+    ): Array<[string, number]> => {
+      const out: Array<[string, number]> = [];
+      for (const key of wanted) {
+        if (have.has(key)) continue;
+        const [cx, cz] = key.split(',').map(Number);
+        const dist = Math.max(Math.abs(cx - currentChunkX), Math.abs(cz - currentChunkZ));
+        out.push([key, dist]);
+      }
+      out.sort((a, b) => a[1] - b[1]);
+      return out;
+    };
+
+    const NEAR_BUDGET = 2;  // heavy: full-detail mesh + voxel gen
+    const FAR_BUDGET = 4;   // lighter: half-res mesh, often shares voxel data with near
+    const missingNear = loadList(wantedNear, this.nearChunks);
+    for (let i = 0; i < Math.min(NEAR_BUDGET, missingNear.length); i++) {
+      const [cx, cz] = missingNear[i][0].split(',').map(Number);
       this.loadNearChunk(cx, cz);
     }
-    // Unload far chunks that are out of range or now served by near.
-    for (const key of [...this.farChunks.keys()]) {
-      if (!wantedFar.has(key) || this.nearChunks.has(key)) this.unloadFarChunk(key);
-    }
-    // Load missing far chunks.
-    for (const key of wantedFar) {
-      if (this.farChunks.has(key) || this.nearChunks.has(key)) continue;
-      const [cx, cz] = key.split(',').map(Number);
+    const missingFar = loadList(wantedFar, this.farChunks);
+    for (let i = 0; i < Math.min(FAR_BUDGET, missingFar.length); i++) {
+      const [cx, cz] = missingFar[i][0].split(',').map(Number);
       this.loadFarChunk(cx, cz);
     }
   }
 
   private getChunkKey(x: number, z: number): string {
     return `${x},${z}`;
+  }
+
+  // Drive the "Show: LOD0 only / LOD1 only / Both" radio in the LOD debug
+  // folder. Toggles `mesh.visible` on the existing chunks; loadNearChunk /
+  // loadFarChunk also call this for newly-streamed chunks so the override
+  // sticks as you walk around.
+  private applyLodForceMode(): void {
+    const mode = this.lodDebug.forceMode;
+    const showNear = mode === 0 || mode === 1;
+    const showFar = mode === 0 || mode === 2;
+    for (const c of this.nearChunks.values()) c.mesh.visible = showNear;
+    for (const c of this.farChunks.values()) c.mesh.visible = showFar;
   }
 
   // Face indices match VoxelChunk: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
@@ -929,8 +1142,22 @@ export class Game {
     this.skySystem.updateForCamera(this.camera);
     this.grassSystem.update(deltaTime);
     this.grassSystem.setSunDir(this.skySystem.getDirectionalLight().position);
-    this.playerLight.position.copy(this.player.eye);
-    this.playerLight.intensity = this.skySystem.getNightFactor() * 1.6;
+    this.worldGenerator.advanceTime(deltaTime);
+    // Camera XZ goes to the chunk shader's fade calculation. The shader's
+    // vWorldXZ is post-worldRoot-scale (metres), so we pass the player
+    // position in the same scaled space.
+    this.worldGenerator.setCameraXZ(
+      this.player.eye.x * Game.WORLD_SCALE,
+      this.player.eye.z * Game.WORLD_SCALE,
+    );
+    this.playerLight.position.copy(this.player.eye).multiplyScalar(Game.WORLD_SCALE);
+    // Headlamp turns on at night AND when the player is in a cave (sky-access
+    // at the eye cell drops from 2 → 0). Both contributions stack so it gets
+    // brighter at night underground than in daytime caves.
+    const eye = this.player.eye;
+    const skyHere = this.worldGenerator.getSkyOpenAt(Math.floor(eye.x), Math.floor(eye.y), Math.floor(eye.z));
+    const caveFactor = skyHere === 0 ? 1.0 : skyHere === 1 ? 0.4 : 0.0;
+    this.playerLight.intensity = this.skySystem.getNightFactor() * 1.6 + caveFactor * 1.4;
     this.updateChunks();
     this.updateVisibilityCulling();
     this.updateTargeted();
@@ -945,8 +1172,13 @@ export class Game {
     this.syncViewModel();
     this.updateHint();
 
-    // Debug values (pre-render).
-    this.debugValues.fps = 1 / deltaTime;
+    // Sample frametime into the rolling-window stat. The graph view
+    // samples `debugValues.frameMs` on its own `interval` schedule.
+    const nowSec = performance.now() / 1000;
+    const frameMs = deltaTime * 1000;
+    this.frameTimeStats.push(nowSec, frameMs);
+    this.debugValues.frameMs = frameMs;
+
     this.debugValues.position.x = this.player.position.x;
     this.debugValues.position.y = this.player.position.y;
     this.debugValues.position.z = this.player.position.z;
@@ -967,12 +1199,28 @@ export class Game {
       this.pendingGpuQueries.push(query);
     }
     const renderMs = performance.now() - renderStart;
-    // Smooth CPU dispatch time so the readout doesn't flicker frame-to-frame.
-    this.debugValues.renderMs = this.debugValues.renderMs * 0.9 + renderMs * 0.1;
-    this.pollGpuTimerQueries();
+    this.renderMsStats.push(nowSec, renderMs);
+    this.debugValues.renderMs = renderMs;
+    this.pollGpuTimerQueries(nowSec);
     this.debugValues.triangles = this.renderer.info.render.triangles;
     this.debugValues.drawCalls = this.renderer.info.render.calls;
     this.debugValues.geometries = this.renderer.info.memory.geometries;
+
+    // Refresh the rolling-window text labels at 4 Hz. Article: "The
+    // frequency at which you update the display does not need to correspond
+    // to rolling window's length." Sampling stays at full frame rate; only
+    // the readout cadence is throttled. The graph view above samples the
+    // per-frame `*Ms` values on its own internal interval.
+    if (nowSec - this.debugPaneRefreshAt >= Game.DEBUG_PANE_INTERVAL_S) {
+      this.debugPaneRefreshAt = nowSec;
+      this.debugValues.fps = this.frameTimeStats.fps();
+      this.debugValues.frameMsAvg = this.frameTimeStats.mean();
+      this.debugValues.frameMsMax = this.frameTimeStats.max();
+      this.debugValues.renderMsAvg = this.renderMsStats.mean();
+      this.debugValues.renderMsMax = this.renderMsStats.max();
+      this.debugValues.gpuRenderMsAvg = this.gpuRenderMsStats.mean();
+      this.debugValues.gpuRenderMsMax = this.gpuRenderMsStats.max();
+    }
     requestAnimationFrame(() => this.animate());
   }
 
@@ -985,14 +1233,14 @@ export class Game {
       a.update(deltaTime, playerPos, getGroundY);
 
       if (!a.isAlive()) {
-        this.scene.remove(a.getGroup());
+        this.worldRoot.remove(a.getGroup());
         this.animals.splice(i, 1);
         const spawn = randomPointAround(playerPos, 40, 90);
         spawn.y = getGroundY(spawn.x, spawn.z);
         const factory = a.kind === 'chicken' ? createChicken : a.kind === 'pig' ? createPig : createDeer;
         const replacement = factory(spawn);
         this.animals.push(replacement);
-        this.scene.add(replacement.getGroup());
+        this.worldRoot.add(replacement.getGroup());
       }
     }
   }
@@ -1069,6 +1317,10 @@ export class Game {
     if (!this.targeted) return;
     const { wx, wy, wz, block } = this.targeted;
     if (block === AIR) return;
+    // Bedrock floor: y=0 is unbreakable so the player can't dig out the
+    // bottom of the world. No SFX or inventory update either — the click
+    // silently no-ops, mirroring how Minecraft handles bedrock.
+    if (wy === 0) return;
     const ok = this.worldGenerator.placeBlock(wx, wy, wz, AIR);
     if (!ok) return;
     this.inventory.addBlock(block, 1);
@@ -1131,7 +1383,7 @@ export class Game {
     // Random tumble axis so consecutive throws don't look identical.
     const spinX = (Math.random() * 2 + 1.5) * (Math.random() < 0.5 ? 1 : -1);
     const spinZ = (Math.random() * 2 + 1.0) * (Math.random() < 0.5 ? 1 : -1);
-    this.scene.add(mesh);
+    this.worldRoot.add(mesh);
 
     const to = new THREE.Vector3(wx + 0.5, wy + 0.5, wz + 0.5);
     const distance = from.distanceTo(to);
@@ -1150,7 +1402,7 @@ export class Game {
         // Target got filled by something else (villager); give the block back.
         this.inventory.addBlock(block, 1);
       }
-      this.scene.remove(mesh);
+      this.worldRoot.remove(mesh);
       geom.dispose();
       for (const m of mats) m.dispose();
       this.placementInFlight--;

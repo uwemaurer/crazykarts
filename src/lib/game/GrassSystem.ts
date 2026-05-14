@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { WorldGenerator } from './WorldGenerator';
-import { GRASS } from './voxel/BlockTypes';
+import { GRASS, MOSS_GRASS } from './voxel/BlockTypes';
+import { sampleGrassTopLuminance } from './voxel/TextureGenerator';
 
 // Per-block density. Each GRASS block contributes BLADES_PER_BLOCK blades to
 // the chunk's instanced mesh.
@@ -59,7 +60,7 @@ function createBladeGeometry(): THREE.BufferGeometry {
 }
 
 export class GrassSystem {
-  private readonly scene: THREE.Scene;
+  private readonly scene: THREE.Object3D;
   private readonly worldGenerator: WorldGenerator;
   private readonly chunkMeshes = new Map<string, THREE.InstancedMesh>();
   private visible = true;
@@ -78,7 +79,7 @@ export class GrassSystem {
     uBacklightColor: { value: new THREE.Color(0xffe9a8) },
   };
 
-  constructor(scene: THREE.Scene, worldGenerator: WorldGenerator) {
+  constructor(scene: THREE.Object3D, worldGenerator: WorldGenerator) {
     this.scene = scene;
     this.worldGenerator = worldGenerator;
     this.bladeGeometry = createBladeGeometry();
@@ -118,7 +119,8 @@ export class GrassSystem {
           break;
         }
         if (topY < 0) continue;
-        if (voxels.get(lx, topY, lz) !== GRASS) continue;
+        const topBlock = voxels.get(lx, topY, lz);
+        if (topBlock !== GRASS && topBlock !== MOSS_GRASS) continue;
 
         const worldBaseY = topY + 1; // sit on top face
         for (let i = 0; i < BLADES_PER_BLOCK; i++) {
@@ -126,6 +128,17 @@ export class GrassSystem {
           const jz = Math.random();
           const wx = cx * CHUNK_W + lx + jx;
           const wz = cz * CHUNK_W + lz + jz;
+          // Rejection sampling: blades cluster where the big grass texture is
+          // darker (mossier/damper areas), thin out in brighter patches. The
+          // smoothstep endpoints are tuned against the texture's luminance
+          // range — at luminance ≤0.28 every blade is kept, at ≥0.55 only
+          // ~50% are kept. Keep the baseline at 0.5 so bright spots still
+          // have some cover.
+          const lum = sampleGrassTopLuminance(wx, wz);
+          const densityT = 1.0 - Math.min(1, Math.max(0, (lum - 0.28) / (0.55 - 0.28)));
+          const acceptance = 0.5 + 0.5 * densityT;
+          if (Math.random() > acceptance) continue;
+
           const yaw = Math.random() * Math.PI * 2;
           // Per-blade height variation: mostly 0.7–1.1, occasional tall blade up to 1.6.
           const roll = Math.random();

@@ -1,5 +1,5 @@
 import type { BlockId } from './BlockTypes';
-import { AIR, LEAVES, ROOF, WOOD } from './BlockTypes';
+import { AIR, LEAVES, ROOF, WATER, WOOD } from './BlockTypes';
 
 // Face bit indices used by the flood-fill connectivity matrix.
 export const FACE_PX = 0;
@@ -13,6 +13,16 @@ export const FACE_MASK_ALL = 0b111111;
 export class VoxelChunk {
   public readonly voxels: Uint8Array;
   private readonly heightMap: Int16Array;
+  // Per-column flow direction for water surfaces. Int8 [-127..127] → [-1..1].
+  // Stored per (x, z) rather than per (x, y, z) because water flow is a 2D
+  // horizontal field — a river's direction is the same whether you sample the
+  // surface block or one below. Non-water columns stay (0, 0).
+  public readonly flowX: Int8Array;
+  public readonly flowZ: Int8Array;
+  // Per-voxel "is this cell reachable by direct skylight from above". Computed
+  // after generation; consumed by the mesher to drive a per-vertex `aSkyLit`
+  // attribute so cave interiors render with a darker ambient floor.
+  public readonly skyOpen: Uint8Array;
   private lod1Cache: Uint8Array | null = null;
   private connectivityCache: Uint8Array | null = null;
   public readonly lod1SizeX: number;
@@ -26,9 +36,29 @@ export class VoxelChunk {
   ) {
     this.voxels = new Uint8Array(sizeX * sizeY * sizeZ);
     this.heightMap = new Int16Array(sizeX * sizeZ);
+    this.flowX = new Int8Array(sizeX * sizeZ);
+    this.flowZ = new Int8Array(sizeX * sizeZ);
+    this.skyOpen = new Uint8Array(sizeX * sizeY * sizeZ);
     this.lod1SizeX = sizeX >> 1;
     this.lod1SizeY = sizeY >> 1;
     this.lod1SizeZ = sizeZ >> 1;
+  }
+
+  public setFlow(x: number, z: number, fx: number, fz: number): void {
+    if (x < 0 || z < 0 || x >= this.sizeX || z >= this.sizeZ) return;
+    const i = z * this.sizeX + x;
+    this.flowX[i] = Math.max(-127, Math.min(127, Math.round(fx * 127)));
+    this.flowZ[i] = Math.max(-127, Math.min(127, Math.round(fz * 127)));
+  }
+
+  public getFlowX(x: number, z: number): number {
+    if (x < 0 || z < 0 || x >= this.sizeX || z >= this.sizeZ) return 0;
+    return this.flowX[z * this.sizeX + x] / 127;
+  }
+
+  public getFlowZ(x: number, z: number): number {
+    if (x < 0 || z < 0 || x >= this.sizeX || z >= this.sizeZ) return 0;
+    return this.flowZ[z * this.sizeX + x] / 127;
   }
 
   public idx(x: number, y: number, z: number): number {
@@ -44,6 +74,10 @@ export class VoxelChunk {
     this.voxels[this.idx(x, y, z)] = block;
     this.lod1Cache = null;
     this.connectivityCache = null;
+    // skyOpen is recomputed by the caller after batch edits via
+    // computeSkyOpen(); per-voxel `set` doesn't keep it in sync to avoid
+    // O(H) work per write during chunk generation. Mining edits from
+    // gameplay are followed by a chunk rebuild that calls computeSkyOpen.
   }
 
   public getLOD1(x: number, y: number, z: number): BlockId {
@@ -82,6 +116,47 @@ export class VoxelChunk {
       }
     }
     return out;
+  }
+
+  // Walk each (x, z) column from the top down and assign one of three
+  // skyOpen levels per cell:
+  //   2 — direct sky access (no obstruction overhead).
+  //   1 — partial: leaves or water somewhere above filter the light.
+  //   0 — sealed: an opaque solid sits above; cave-dark.
+  // Leaves and water transmit some light (tree shadow shouldn't read like
+  // a cave), so they don't fully seal — they drop level 2 → 1. Anything
+  // else opaque seals level → 0 for everything below. The mesher samples
+  // this at the air-side neighbour of each emitted face; the shader maps
+  // the level to a brightness multiplier.
+  public computeSkyOpen(): void {
+    const W = this.sizeX, H = this.sizeY, D = this.sizeZ;
+    for (let x = 0; x < W; x++) {
+      for (let z = 0; z < D; z++) {
+        let level = 2;
+        for (let y = H - 1; y >= 0; y--) {
+          const i = this.idx(x, y, z);
+          const v = this.voxels[i];
+          if (v === AIR) {
+            this.skyOpen[i] = level;
+          } else if (v === LEAVES || v === WATER) {
+            // Transmit but attenuate. The leaves/water cell itself records
+            // the pre-attenuation level so its top face stays bright.
+            this.skyOpen[i] = level;
+            if (level > 1) level = 1;
+          } else {
+            // Opaque solid. Record the pre-seal level for this cell so its
+            // own top face renders correctly, then seal everything below.
+            this.skyOpen[i] = level;
+            level = 0;
+          }
+        }
+      }
+    }
+  }
+
+  public getSkyOpen(x: number, y: number, z: number): number {
+    if (x < 0 || y < 0 || z < 0 || x >= this.sizeX || y >= this.sizeY || z >= this.sizeZ) return 2;
+    return this.skyOpen[this.idx(x, y, z)];
   }
 
   public computeHeightMap(): void {
