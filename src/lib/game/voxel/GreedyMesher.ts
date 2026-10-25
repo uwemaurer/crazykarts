@@ -82,11 +82,24 @@ export function buildChunkGeometry(
       let n = 0;
       for (x[v] = 0; x[v] < dv; x[v]++) {
         for (x[u] = 0; x[u] < du; x[u]++, n++) {
-          const a = x[d] >= 0 ? getVoxel(x[0], x[1], x[2]) : AIR;
-          const b = x[d] < dd - 1 ? getVoxel(x[0] + q[0], x[1] + q[1], x[2] + q[2]) : AIR;
+          // a is outside this chunk on the low edge, b on the high edge.
+          const lowEdge = x[d] < 0;
+          const highEdge = x[d] >= dd - 1;
+          // Underside of the world floor: y=0 is bedrock, nobody sees below it.
+          if (d === 1 && lowEdge) {
+            mask[n] = 0;
+            continue;
+          }
+          // Sideways the sampler reads the neighbour chunk (AIR if it isn't
+          // generated yet), so faces hidden by a neighbour's solid block are
+          // skipped. Above the world is always air.
+          const a = getVoxel(x[0], x[1], x[2]);
+          const b = d === 1 && highEdge ? AIR : getVoxel(x[0] + q[0], x[1] + q[1], x[2] + q[2]);
           const aSolid = a !== AIR;
           const bSolid = b !== AIR;
-          if (aSolid === bSolid) {
+          // A face whose solid block lives in the neighbour chunk is drawn by
+          // that chunk, so each border face is emitted exactly once.
+          if (aSolid === bSolid || (lowEdge && aSolid) || (highEdge && bSolid)) {
             mask[n] = 0;
             continue;
           }

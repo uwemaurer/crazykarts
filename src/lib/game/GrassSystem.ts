@@ -10,6 +10,11 @@ const BLADES_PER_BLOCK = 6;
 const BLADE_WIDTH = 0.09;
 const BLADE_HEIGHT = 0.55;
 const CHUNK_W = 32;
+// Blades shrink to nothing between these XZ distances from the camera, so the
+// edge of the grass area (Game.GRASS_RADIUS_CHUNKS, ≥64 blocks) never shows.
+// Fog starts at 60 blocks, so distant grass would barely read anyway.
+const FADE_START = 40.0;
+const FADE_END = 60.0;
 
 /**
  * Curved, tapering 5-vertex blade geometry:
@@ -62,7 +67,8 @@ function createBladeGeometry(): THREE.BufferGeometry {
 export class GrassSystem {
   private readonly scene: THREE.Object3D;
   private readonly worldGenerator: WorldGenerator;
-  private readonly chunkMeshes = new Map<string, THREE.InstancedMesh>();
+  // null = chunk scanned but has no grass (so we don't rescan it).
+  private readonly chunkMeshes = new Map<string, THREE.InstancedMesh | null>();
   private visible = true;
 
   private readonly bladeGeometry: THREE.BufferGeometry;
@@ -93,11 +99,19 @@ export class GrassSystem {
   public setVisible(visible: boolean): void {
     if (this.visible === visible) return;
     this.visible = visible;
-    for (const mesh of this.chunkMeshes.values()) mesh.visible = visible;
+    for (const mesh of this.chunkMeshes.values()) if (mesh) mesh.visible = visible;
   }
 
   public update(deltaTime: number): void {
     this.uniforms.uTime.value += deltaTime;
+  }
+
+  public hasChunk(cx: number, cz: number): boolean {
+    return this.chunkMeshes.has(`${cx},${cz}`);
+  }
+
+  public getChunks(): Array<[number, number]> {
+    return [...this.chunkMeshes.keys()].map(k => k.split(',').map(Number) as [number, number]);
   }
 
   public addChunk(cx: number, cz: number): void {
@@ -149,7 +163,10 @@ export class GrassSystem {
       }
     }
 
-    if (positions.length === 0) return;
+    if (positions.length === 0) {
+      this.chunkMeshes.set(key, null);
+      return;
+    }
 
     const mesh = new THREE.InstancedMesh(this.bladeGeometry, this.material, positions.length);
     mesh.frustumCulled = true;
@@ -181,11 +198,12 @@ export class GrassSystem {
 
   public removeChunk(cx: number, cz: number): void {
     const key = `${cx},${cz}`;
+    if (!this.chunkMeshes.has(key)) return;
     const mesh = this.chunkMeshes.get(key);
+    this.chunkMeshes.delete(key);
     if (!mesh) return;
     this.scene.remove(mesh);
     mesh.dispose();
-    this.chunkMeshes.delete(key);
   }
 
   public rebuildChunk(cx: number, cz: number): void {
@@ -247,6 +265,10 @@ float noise2d(vec2 p) {
 // default instance-transform path picks it up without double-application.
 transformed.z += uv.y * uv.y * 0.18;
 vHeight = uv.y;
+// Distance fade: shrink the whole blade toward its root as it nears the
+// edge of the grass area, so chunks can be added/removed without popping.
+vec3 gRoot = (modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+transformed *= 1.0 - smoothstep(${FADE_START.toFixed(1)}, ${FADE_END.toFixed(1)}, distance(gRoot.xz, cameraPosition.xz));
 `,
         )
         .replace(

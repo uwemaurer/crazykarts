@@ -160,11 +160,16 @@ export class Game {
   private readonly SAVE_INTERVAL_MS = 15000;
   // More aggressive LOD: a smaller full-detail core, a 1-chunk overlap band
   // where both LODs render with dithered cross-fade (so the transition is
-  // invisible), and a longer LOD1 horizon for distance perception.
+  // invisible), and an LOD1 horizon out to where the fog is opaque.
   // FADE_BAND_CHUNKS controls overlap thickness — fewer = sharper switch.
+  // The fog ends at 180 blocks (SkySystem); 7 chunks always reaches past
+  // that (≥224 blocks), and anything further is invisible anyway.
   private readonly RENDER_DISTANCE_NEAR = 3;
-  private readonly RENDER_DISTANCE_FAR = 14;
+  private readonly RENDER_DISTANCE_FAR = 7;
   private readonly FADE_BAND_CHUNKS = 1;
+  // Grass only on the chunks around the player. Radius 2 always covers at
+  // least 64 blocks, past GrassSystem's blade fade-out (60 blocks).
+  private readonly GRASS_RADIUS_CHUNKS = 2;
   // LOD debug state (driven by tweakpane bindings). lodForceMode=0 shows
   // both LODs normally; 1 hides LOD1 (near only); 2 hides LOD0 (far only).
   // lodDebugMode is the bit-flag uniform: 1 = no dither, 2 = visualise.
@@ -1339,7 +1344,6 @@ export class Game {
     this.nearChunks.set(key, chunk);
     this.worldRoot.add(chunk.mesh);
     if (this.lodDebug.forceMode === 2) chunk.mesh.visible = false;
-    this.grassSystem?.addChunk(chunkX, chunkZ);
   }
 
   private unloadNearChunk(key: string) {
@@ -1349,7 +1353,6 @@ export class Game {
     this.nearChunks.delete(key);
     const [cx, cz] = key.split(',').map(Number);
     this.worldGenerator.disposeChunkFull(cx, cz);
-    this.grassSystem?.removeChunk(cx, cz);
   }
 
   private loadFarChunk(chunkX: number, chunkZ: number) {
@@ -1454,6 +1457,36 @@ export class Game {
       const [cx, cz] = missingFar[i][0].split(',').map(Number);
       this.loadFarChunk(cx, cz);
     }
+
+    this.syncGrass(currentChunkX, currentChunkZ);
+  }
+
+  // Grass follows a small square around the player, independent of the
+  // near ring. Blades fade out before the square's edge, so chunks entering
+  // or leaving it never pop.
+  private syncGrass(currentChunkX: number, currentChunkZ: number) {
+    if (!this.grassSystem) return;
+    const r = this.GRASS_RADIUS_CHUNKS;
+    const inRange = (cx: number, cz: number) =>
+      Math.max(Math.abs(cx - currentChunkX), Math.abs(cz - currentChunkZ)) <= r;
+
+    for (const [cx, cz] of this.grassSystem.getChunks()) {
+      if (!inRange(cx, cz)) this.grassSystem.removeChunk(cx, cz);
+    }
+    // Building grass scans a whole chunk, so do one per frame, closest first.
+    let best: [number, number] | null = null;
+    let bestDist = Infinity;
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dz = -r; dz <= r; dz++) {
+        const cx = currentChunkX + dx;
+        const cz = currentChunkZ + dz;
+        if (this.grassSystem.hasChunk(cx, cz)) continue;
+        if (!this.nearChunks.has(this.getChunkKey(cx, cz))) continue;
+        const dist = Math.max(Math.abs(dx), Math.abs(dz));
+        if (dist < bestDist) { bestDist = dist; best = [cx, cz]; }
+      }
+    }
+    if (best) this.grassSystem.addChunk(best[0], best[1]);
   }
 
   private getChunkKey(x: number, z: number): string {
@@ -1709,8 +1742,7 @@ export class Game {
     const chunkSize = this.worldGenerator.getChunkSize();
     const cx = Math.floor(wx / chunkSize);
     const cz = Math.floor(wz / chunkSize);
-    const key = this.getChunkKey(cx, cz);
-    if (this.nearChunks.has(key)) this.grassSystem.rebuildChunk(cx, cz);
+    if (this.grassSystem.hasChunk(cx, cz)) this.grassSystem.rebuildChunk(cx, cz);
   }
 
   private syncViewModel() {
