@@ -3,7 +3,7 @@ import { createNoise2D, createNoise3D } from 'simplex-noise';
 import { VoxelChunk } from './voxel/VoxelChunk';
 import { buildChunkGeometry } from './voxel/GreedyMesher';
 import { createBlockTextureArray, createChunkMaterial, createChunkSharedUniforms, createGrassTopTexture, type ChunkMaterial, type ChunkSharedUniforms } from './voxel/TextureGenerator';
-import { AIR, COAL_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES, MOSS_GRASS, ROAD, ROOF, SAND, SNOW, STONE, WATER, WOOD, type BlockId } from './voxel/BlockTypes';
+import { AIR, BARBED_WIRE, BARS, COAL_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES, MOSS_GRASS, POLICE, ROAD, ROOF, SAND, SNOW, STONE, WATER, WOOD, type BlockId } from './voxel/BlockTypes';
 
 export interface WorldChunk {
   mesh: THREE.Group;
@@ -78,12 +78,13 @@ export interface PlanBlock {
   block: BlockId;
 }
 
-interface House {
+export interface HousePlot {
   x: number;
   z: number;
   w: number;
   d: number;
   floorY: number;
+  seed: number;
 }
 
 // Construction site offset relative to village center (ordinal angle, clears cardinal roads)
@@ -99,6 +100,45 @@ const FARM_OFFSET_X = 11;
 const FARM_OFFSET_Z = 11;
 const FARM_W = 5;
 const FARM_D = 5;
+
+// Police fortress — a walled castle-like landmark: outer battlements topped
+// with barbed wire, four corner towers, a south gate, and a row of barred
+// jail cells along the inner north wall. Every village gets one, placed well
+// beyond the houses on the free ordinal diagonal (site and farm take the
+// other two; cardinals are reserved for roads). Village-less regions get one
+// more rarely as the lone structure in the wilderness — see getForestStation.
+const POLICE_OFFSET_X = 24;
+const POLICE_OFFSET_Z = -24;
+// Width 15 makes the inner span (13) divide cleanly into three 3-wide jail
+// cells separated by 1-wide partitions.
+const POLICE_W = 15;
+const POLICE_D = 13;
+const POLICE_WALL_H = 5;       // outer curtain-wall height in blocks
+const POLICE_TOWER_EXTRA = 3;  // corner towers rise this many blocks above the wall
+const POLICE_CELL_COUNT = 3;
+// Fraction of village-less regions that get a wilderness police fortress.
+const FOREST_STATION_PROB = 0.5;
+
+export interface PoliceStationData {
+  x: number;
+  z: number;
+  floorY: number;
+  seed: number;
+  key: string;
+}
+
+// Interior voxel bounds (inclusive) of one jail cell, plus which cell is the
+// quest cell. Gameplay code uses this to place furniture, prisoners and the
+// quest marker so they line up exactly with the stamped geometry.
+export interface PoliceStationCell {
+  index: number;
+  isQuest: boolean;
+  xMin: number;
+  xMax: number;
+  zMin: number;
+  zMax: number;
+  floorY: number;
+}
 
 function deterministicRandom(x: number, z: number, seed: number): number {
   let h = Math.imul(x | 0, 374761393) ^ Math.imul(z | 0, 668265263) ^ (seed | 0);
@@ -286,6 +326,70 @@ export class WorldGenerator {
       }
     }
     return villages;
+  }
+
+  // All police fortresses (village + wilderness) whose centre lies within
+  // halfExtent of (worldX, worldZ). Each carries a stable key so gameplay
+  // code can dedupe activations.
+  public getPoliceStationsNear(worldX: number, worldZ: number, halfExtent: number): PoliceStationData[] {
+    const rxC = Math.floor(worldX / REGION_W);
+    const rzC = Math.floor(worldZ / REGION_W);
+    const reach = Math.ceil(halfExtent / REGION_W) + 1;
+    const out: PoliceStationData[] = [];
+    for (let drx = -reach; drx <= reach; drx++) {
+      for (let drz = -reach; drz <= reach; drz++) {
+        const rx = rxC + drx;
+        const rz = rzC + drz;
+        const v = this.getVillage(rx, rz);
+        let s: PoliceStationData | null = null;
+        if (v) {
+          s = {
+            x: v.x + POLICE_OFFSET_X,
+            z: v.z + POLICE_OFFSET_Z,
+            floorY: v.floorY,
+            seed: v.seed ^ 0x9001,
+            key: `pv-${rx},${rz}`,
+          };
+        } else {
+          const f = this.getForestStation(rx, rz);
+          if (f) s = { x: f.x, z: f.z, floorY: f.floorY, seed: f.seed, key: `pf-${rx},${rz}` };
+        }
+        if (s && Math.abs(s.x - worldX) <= halfExtent && Math.abs(s.z - worldZ) <= halfExtent) {
+          out.push(s);
+        }
+      }
+    }
+    return out;
+  }
+
+  // Interior bounds of each jail cell in a fortress, matching the geometry
+  // stampPoliceStation lays down: three 3-wide cells along the inner north
+  // wall, partitions between them. One cell (chosen deterministically from
+  // the station seed) is flagged as the quest cell.
+  public getPoliceStationCells(station: PoliceStationData): PoliceStationCell[] {
+    const halfW = Math.floor(POLICE_W / 2);
+    const halfD = Math.floor(POLICE_D / 2);
+    const minX = station.x - halfW;
+    const minZ = station.z - halfD;
+    const interiorMinX = minX + 1;
+    const questIndex = Math.floor(
+      deterministicRandom(station.x, station.z, station.seed ^ 0xCE11) * POLICE_CELL_COUNT,
+    );
+    const cells: PoliceStationCell[] = [];
+    for (let i = 0; i < POLICE_CELL_COUNT; i++) {
+      // Partitions sit at interiorMinX + i*4; each cell is the 3 columns after one.
+      const cellXMin = interiorMinX + i * 4 + 1;
+      cells.push({
+        index: i,
+        isQuest: i === questIndex,
+        xMin: cellXMin,
+        xMax: cellXMin + 2,
+        zMin: minZ + 1,
+        zMax: minZ + 2,
+        floorY: station.floorY,
+      });
+    }
+    return cells;
   }
 
   public getConstructionPlan(v: Village): PlanBlock[] {
@@ -498,6 +602,9 @@ export class WorldGenerator {
       case SNOW:   return { r: 234, g: 240, b: 246 };
       case ROAD:   return { r: 188, g: 188, b: 196 };
       case ROOF:   return { r: 182, g: 62, b: 34 };
+      case POLICE: return { r: 58, g: 84, b: 200 };
+      case BARS:        return { r: 120, g: 124, b: 134 };
+      case BARBED_WIRE: return { r: 96, g: 98, b: 104 };
       default:     return { r: 40, g: 40, b: 46 };
     }
   }
@@ -569,6 +676,7 @@ export class WorldGenerator {
       this.carveRivers(chunk, cx, cz);
       this.scatterTrees(chunk, cx, cz);
       this.stampVillagesAndRoads(chunk, cx, cz);
+      this.stampForestStations(chunk, cx, cz);
       this.applyMods(chunk, cx, cz);
       chunk.computeSkyOpen();
       chunk.computeHeightMap();
@@ -995,8 +1103,10 @@ export class WorldGenerator {
     return { rx, rz, x, z, floorY: naturalH, seed };
   }
 
-  private getHouses(v: Village): House[] {
-    const houses: House[] = [];
+  // Deterministic house plots for a village. Public so gameplay code can
+  // furnish their interiors (torches, beds, doors) when a village activates.
+  public getHouses(v: Village): HousePlot[] {
+    const houses: HousePlot[] = [];
     // 8 diagonal positions — offset from cardinals so roads don't pass through houses
     for (let i = 0; i < 8; i++) {
       const skip = deterministicRandom(v.rx * 37 + i, v.rz * 41 + i, v.seed);
@@ -1008,7 +1118,8 @@ export class WorldGenerator {
       const hz = v.z + Math.round(Math.sin(angle) * dist);
       const w = 5 + Math.floor(deterministicRandom(hx, hz, v.seed ^ 0x8B) * 2);
       const d = 5 + Math.floor(deterministicRandom(hz, hx, v.seed ^ 0x9C) * 2);
-      houses.push({ x: hx, z: hz, w, d, floorY: v.floorY });
+      const seed = Math.floor(deterministicRandom(hx, hz, v.seed ^ 0xA17E) * 1e9);
+      houses.push({ x: hx, z: hz, w, d, floorY: v.floorY, seed });
     }
     return houses;
   }
@@ -1107,6 +1218,149 @@ export class WorldGenerator {
       }
       this.stampFarm(chunk, cx, cz, v);
       this.stampConstructionInitial(chunk, cx, cz, v);
+      this.stampPoliceStation(chunk, cx, cz, v.x + POLICE_OFFSET_X, v.z + POLICE_OFFSET_Z, v.floorY);
+    }
+  }
+
+  // Deterministic wilderness police station for a region. Only regions that
+  // have no village get one (the station is then the region's lone landmark),
+  // and only a fraction of those — see FOREST_STATION_PROB. Position is
+  // jittered within the region's padded interior, same scheme as getVillage,
+  // so it lands among the scattered trees with a clearing carved around it.
+  private getForestStation(rx: number, rz: number): { x: number; z: number; floorY: number; seed: number } | null {
+    if (this.getVillage(rx, rz) !== null) return null;
+    if (deterministicRandom(rx, rz, this.seed ^ 0x90F1) > FOREST_STATION_PROB) return null;
+    const jx = deterministicRandom(rx, rz, this.seed ^ 0x90E2);
+    const jz = deterministicRandom(rx, rz, this.seed ^ 0x90D3);
+    const padding = Math.floor(CHUNK_W * 0.75);
+    const inner = REGION_W - padding * 2;
+    const x = rx * REGION_W + padding + Math.floor(jx * inner);
+    const z = rz * REGION_W + padding + Math.floor(jz * inner);
+    const naturalH = this.terrainHeight(x, z);
+    if (naturalH <= SEA_LEVEL + 1 || naturalH >= SNOW_LINE) return null;
+    const seed = Math.floor(deterministicRandom(rx, rz, this.seed ^ 0x90C4) * 1e9);
+    return { x, z, floorY: naturalH, seed };
+  }
+
+  private stampForestStations(chunk: VoxelChunk, cx: number, cz: number): void {
+    const rx0 = Math.floor(cx / REGION_CHUNKS);
+    const rz0 = Math.floor(cz / REGION_CHUNKS);
+    for (let drx = -1; drx <= 1; drx++) {
+      for (let drz = -1; drz <= 1; drz++) {
+        const s = this.getForestStation(rx0 + drx, rz0 + drz);
+        if (s) this.stampPoliceStation(chunk, cx, cz, s.x, s.z, s.floorY);
+      }
+    }
+  }
+
+  // Stamps a police fortress centred on (centerX, centerZ) with its courtyard
+  // floor at floorY: a flat apron, a crenellated POLICE curtain wall topped
+  // with alternating barbed wire, four solid corner towers, a south gate, and
+  // a roofed row of barred jail cells along the inner north wall. Only the
+  // part overlapping this chunk is written — callers stamp the same fortress
+  // into every chunk it touches.
+  private stampPoliceStation(
+    chunk: VoxelChunk, cx: number, cz: number,
+    centerX: number, centerZ: number, floorY: number,
+  ): void {
+    const worldX0 = cx * CHUNK_W;
+    const worldZ0 = cz * CHUNK_W;
+    const halfW = Math.floor(POLICE_W / 2);
+    const halfD = Math.floor(POLICE_D / 2);
+    const minX = centerX - halfW;
+    const maxX = centerX + halfW;
+    const minZ = centerZ - halfD;
+    const maxZ = centerZ + halfD;
+
+    // Early out if the fortress + apron (and the towers, which poke one cell
+    // past each corner) can't touch this chunk.
+    if (maxX + 2 < worldX0 || minX - 2 >= worldX0 + CHUNK_W) return;
+    if (maxZ + 2 < worldZ0 || minZ - 2 >= worldZ0 + CHUNK_W) return;
+
+    const wallTop = floorY + POLICE_WALL_H - 1;
+    const battY = wallTop + 1;                         // crenellation / barbed-wire row
+    const towerTop = wallTop + POLICE_TOWER_EXTRA;
+    const towerBattY = towerTop + 1;
+
+    // Chunk-clipped voxel write in world coordinates.
+    const set = (wx: number, wy: number, wz: number, block: BlockId) => {
+      const lx = wx - worldX0;
+      const lz = wz - worldZ0;
+      if (lx < 0 || lx >= CHUNK_W || lz < 0 || lz >= CHUNK_W) return;
+      if (wy < 0 || wy >= CHUNK_H) return;
+      chunk.set(lx, wy, lz, block);
+    };
+
+    // Flat apron: solid ground up to floorY-1, air above. Clears terrain
+    // bumps, trees and anything else the footprint+margin lands on. Two cells
+    // of margin so the corner towers sit on flattened ground.
+    for (let wx = minX - 2; wx <= maxX + 2; wx++) {
+      for (let wz = minZ - 2; wz <= maxZ + 2; wz++) {
+        const lx = wx - worldX0;
+        const lz = wz - worldZ0;
+        if (lx < 0 || lx >= CHUNK_W || lz < 0 || lz >= CHUNK_W) continue;
+        for (let y = 0; y < CHUNK_H; y++) {
+          const cur = chunk.get(lx, y, lz);
+          if (y < floorY - 1) {
+            if (cur === AIR || cur === WATER || cur === WOOD || cur === LEAVES) chunk.set(lx, y, lz, DIRT);
+          } else if (y === floorY - 1) {
+            chunk.set(lx, y, lz, GRASS);
+          } else if (cur !== AIR) {
+            chunk.set(lx, y, lz, AIR);
+          }
+        }
+      }
+    }
+
+    // Curtain wall (perimeter edges) up to wallTop; hollow courtyard already
+    // cleared by the apron.
+    for (let wx = minX; wx <= maxX; wx++) {
+      for (let wz = minZ; wz <= maxZ; wz++) {
+        if (wx !== minX && wx !== maxX && wz !== minZ && wz !== maxZ) continue;
+        for (let y = floorY; y <= wallTop; y++) set(wx, y, wz, POLICE);
+        // Battlements: alternating POLICE merlons and barbed wire along the top.
+        set(wx, battY, wz, (wx + wz) & 1 ? BARBED_WIRE : POLICE);
+      }
+    }
+
+    // Four solid corner towers, centred on the corners so they bulge out like
+    // bastions, rising above the curtain wall and crenellated at the top.
+    for (const [tx, tz] of [[minX, minZ], [maxX, minZ], [minX, maxZ], [maxX, maxZ]] as const) {
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const wx = tx + dx;
+          const wz = tz + dz;
+          for (let y = floorY; y <= towerTop; y++) set(wx, y, wz, POLICE);
+          if ((wx + wz) & 1) set(wx, towerBattY, wz, POLICE);
+        }
+      }
+    }
+
+    // South gate: a 3-wide, 3-tall opening through the south wall, with the
+    // battlement above it cleared too.
+    for (let gx = centerX - 1; gx <= centerX + 1; gx++) {
+      for (let y = floorY; y <= floorY + 2; y++) set(gx, y, maxZ, AIR);
+      set(gx, battY, maxZ, AIR);
+    }
+
+    // Barred jail cells along the inner north wall. The curtain wall at minZ
+    // is the cells' back; POLICE partitions every 4 blocks divide them; the
+    // courtyard-facing front (zFront) is BARS; a POLICE roof caps the band.
+    const zBack = minZ + 1;
+    const zFront = minZ + 3;
+    const cellRoofY = floorY + 3;
+    const interiorMinX = minX + 1;
+    const interiorMaxX = maxX - 1;
+    for (let wx = interiorMinX; wx <= interiorMaxX; wx++) {
+      const isDivider = (wx - interiorMinX) % 4 === 0 || wx === interiorMaxX;
+      for (let wz = zBack; wz <= zFront; wz++) set(wx, cellRoofY, wz, POLICE);
+      if (isDivider) {
+        for (let wz = zBack; wz <= zFront; wz++) {
+          for (let y = floorY; y < cellRoofY; y++) set(wx, y, wz, POLICE);
+        }
+      } else {
+        for (let y = floorY; y < cellRoofY; y++) set(wx, y, zFront, BARS);
+      }
     }
   }
 
@@ -1160,7 +1414,7 @@ export class WorldGenerator {
     }
   }
 
-  private stampHouse(chunk: VoxelChunk, cx: number, cz: number, house: House): void {
+  private stampHouse(chunk: VoxelChunk, cx: number, cz: number, house: HousePlot): void {
     const worldX0 = cx * CHUNK_W;
     const worldZ0 = cz * CHUNK_W;
     const halfW = Math.floor(house.w / 2);
@@ -1221,6 +1475,19 @@ export class WorldGenerator {
       chunk.set(dlx, house.floorY, dlz, AIR);
       chunk.set(dlx, house.floorY + 1, dlz, AIR);
     }
+
+    // Windows: one cleared block mid-height in the centre of each of the
+    // three non-door walls.
+    const winY = house.floorY + 2;
+    const clearWindow = (wx: number, wz: number) => {
+      const lx = wx - worldX0;
+      const lz = wz - worldZ0;
+      if (lx < 0 || lx >= CHUNK_W || lz < 0 || lz >= CHUNK_W) return;
+      if (winY < CHUNK_H) chunk.set(lx, winY, lz, AIR);
+    };
+    clearWindow(house.x, minZ);   // back wall
+    clearWindow(minX, house.z);   // left wall
+    clearWindow(maxX, house.z);   // right wall
   }
 
   private rebuildChunkMesh(cx: number, cz: number, chunk: VoxelChunk): void {

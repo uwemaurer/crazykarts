@@ -123,6 +123,16 @@ export class Villager {
     head.castShadow = true;
     this.group.add(head);
 
+    // Face on the head's front (+Z) — two eyes and a mouth.
+    const faceMat = new THREE.MeshLambertMaterial({ color: 0x2a2018 });
+    const leftEye = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.04), faceMat);
+    leftEye.position.set(-0.1, 0.05, 0.2);
+    const rightEye = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 0.04), faceMat);
+    rightEye.position.set(0.1, 0.05, 0.2);
+    const mouth = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.035, 0.04), faceMat);
+    mouth.position.set(0, -0.1, 0.2);
+    head.add(leftEye, rightEye, mouth);
+
     const hat = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.12, 0.52), hatMat);
     hat.position.y = 1.76;
     this.group.add(hat);

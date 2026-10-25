@@ -4,13 +4,16 @@ import { WorldGenerator } from './WorldGenerator';
 import type { PlanBlock, Village, WorldChunk } from './WorldGenerator';
 import { Animal, createChicken, createDeer, createPig } from './Animal';
 import { Villager, type Profession, type VillageEconomy } from './Villager';
+import { PoliceStation, type PoliceStationContext } from './PoliceStation';
+import { HouseInterior } from './HouseInterior';
+import { Companion, type CarryLoad, type CompanionContext, type GatherType } from './Companion';
 import { Sfx } from './Sfx';
 import { Player } from './Player';
 import { Inventory, blockLabel } from './Inventory';
 import { InventoryHud } from './InventoryHud';
 import { BlockHighlight } from './BlockHighlight';
 import { ViewModel } from './ViewModel';
-import { AIR, BLOCK_TEXTURES, LEAVES, WOOD, type BlockId } from './voxel/BlockTypes';
+import { AIR, BLOCK_TEXTURES, COAL_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES, SAND, STONE, WOOD, type BlockId } from './voxel/BlockTypes';
 import { getTileTexture } from './voxel/TextureGenerator';
 import gsap from 'gsap';
 import { SaveManager, type SaveData, type SavedVillage } from './SaveManager';
@@ -56,12 +59,36 @@ export class Game {
   private villageCenters: Map<string, THREE.Vector3> = new Map();
   private economyHud!: HTMLDivElement;
   private villagerSpawnAccum = 0;
+  private policeStations: PoliceStation[] = [];
+  private activatedStationKeys: Set<string> = new Set();
+  private stationSpawnAccum = 0;
+  private clickRaycaster = new THREE.Raycaster();
+  private houseInteriors: HouseInterior[] = [];
+  private bedPromptElement!: HTMLDivElement;
+  private sleepOverlay!: HTMLDivElement;
+  private sleeping = false;
+
+  private companion: Companion | null = null;
+  private commandMode = false;
+  private commandBuffer = '';
+  private commandBoxElement!: HTMLDivElement;
   private readonly ANIMAL_COUNT_CHICKEN = 10;
   private readonly ANIMAL_COUNT_PIG = 6;
   private readonly ANIMAL_COUNT_DEER = 5;
   private readonly VILLAGE_ACTIVATION_RADIUS = 140;
   private readonly MAX_VILLAGERS = 75;
   private readonly REACH = 5;
+  // Police-station ring/figure clicks have a slightly longer reach than block
+  // mining so you can talk through the bars from just outside a cell.
+  private readonly STATION_REACH = 8;
+
+  private readonly policeStationCtx: PoliceStationContext = {
+    getGroundY: (x, z) => this.worldGenerator.getHeightAt(x, z),
+    countBlock: (b) => this.inventory.countBlock(b),
+    consumeBlocks: (b, n) => this.inventory.consumeBlocks(b, n),
+    rewardBlocks: (b, n) => { this.inventory.addBlock(b, n); },
+    showMessage: (text) => this.showToast(text, 3500),
+  };
 
   private clock: THREE.Timer;
   private keyStates: { [key: string]: boolean } = {};
@@ -204,6 +231,8 @@ export class Game {
     this.createTitleOverlay(container, !!saved);
     this.createReticle(container);
     this.createHint(container);
+    this.createSleepUi(container);
+    this.createCommandBox(container);
     this.setupDebugPane();
     this.setupMinimap(container);
     this.setupEconomyHud(container);
@@ -268,6 +297,61 @@ export class Game {
     this.hintElement.style.opacity = '0';
     this.hintElement.style.transition = 'opacity 0.2s';
     container.appendChild(this.hintElement);
+  }
+
+  private createSleepUi(container: HTMLElement) {
+    // Bottom-of-screen prompt shown while the player stands near a bed.
+    this.bedPromptElement = document.createElement('div');
+    const p = this.bedPromptElement.style;
+    p.position = 'absolute';
+    p.bottom = '96px';
+    p.left = '50%';
+    p.transform = 'translateX(-50%)';
+    p.padding = '6px 14px';
+    p.borderRadius = '6px';
+    p.background = 'rgba(0,0,0,0.66)';
+    p.color = 'white';
+    p.font = '600 13px/1.3 Arial, sans-serif';
+    p.pointerEvents = 'none';
+    p.zIndex = '7';
+    p.opacity = '0';
+    p.transition = 'opacity 0.15s';
+    p.whiteSpace = 'nowrap';
+    this.bedPromptElement.textContent = 'Click the bed to sleep';
+    container.appendChild(this.bedPromptElement);
+
+    // Full-screen fade used by the sleep transition.
+    this.sleepOverlay = document.createElement('div');
+    const o = this.sleepOverlay.style;
+    o.position = 'absolute';
+    o.inset = '0';
+    o.background = '#000';
+    o.opacity = '0';
+    o.pointerEvents = 'none';
+    o.zIndex = '40';
+    container.appendChild(this.sleepOverlay);
+  }
+
+  private createCommandBox(container: HTMLElement) {
+    // Bottom-of-screen prompt for typed companion commands. The keystrokes
+    // don't go through a real <input> (pointer is locked); we capture them
+    // ourselves and render the buffer here.
+    this.commandBoxElement = document.createElement('div');
+    const s = this.commandBoxElement.style;
+    s.position = 'absolute';
+    s.bottom = '128px';
+    s.left = '50%';
+    s.transform = 'translateX(-50%)';
+    s.padding = '8px 14px';
+    s.borderRadius = '6px';
+    s.background = 'rgba(0,0,0,0.78)';
+    s.color = '#cfeaff';
+    s.font = '600 14px/1.3 "SF Mono", Menlo, monospace';
+    s.pointerEvents = 'none';
+    s.zIndex = '8';
+    s.display = 'none';
+    s.whiteSpace = 'nowrap';
+    container.appendChild(this.commandBoxElement);
   }
 
   private updateTitle() {
@@ -340,6 +424,19 @@ export class Game {
     // Stays in scene root (not worldRoot) so it doesn't get rescaled.
     this.scene.add(this.camera);
     this.camera.add(this.viewModel.getObject());
+
+    // The player's companion spawns right next to them.
+    const companionCtx: CompanionContext = {
+      getPlayerPos: () => this.player.position,
+      getGroundY: (x, z) => this.worldGenerator.getHeightAt(x, z),
+      findTarget: (type, from) => this.findCompanionTarget(type, from),
+      harvest: (type, at) => this.harvestForCompanion(type, at),
+      deliver: (load) => this.deliverFromCompanion(load),
+      showMessage: (text) => this.showToast(text, 2500),
+    };
+    const companionSpawn = new THREE.Vector3(spawn.x + 1.5, spawn.y, spawn.z);
+    this.companion = new Companion(companionSpawn, companionCtx);
+    this.worldRoot.add(this.companion.getGroup());
   }
 
   // Each handler mutates state and returns the toast message to show.
@@ -387,6 +484,18 @@ export class Game {
     }, { capture: true });
 
     window.addEventListener('keydown', (event) => {
+      // Companion command input swallows all keystrokes until submitted/cancelled.
+      if (this.commandMode) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.handleCommandKey(event);
+        return;
+      }
+      if (event.code === 'Enter') {
+        this.openCommandMode();
+        event.preventDefault();
+        return;
+      }
       // Number keys select hotbar slots.
       if (event.code.startsWith('Digit')) {
         const n = parseInt(event.code.slice(5), 10);
@@ -424,8 +533,15 @@ export class Game {
     this.canvas.addEventListener('contextmenu', (event) => event.preventDefault());
     this.canvas.addEventListener('mousedown', (event) => {
       if (!this.pointerLocked) return;
-      if (event.button === 0) this.mineTargeted();
-      else if (event.button === 2) this.placeAtTargeted();
+      if (this.commandMode) return;
+      if (event.button === 0) {
+        // A left click first tries world interactions — a police-station ring
+        // or quest figure, then a house door or bed — and only mines the
+        // targeted block if none of those were hit.
+        if (!this.tryStationClick() && !this.tryHouseClick()) this.mineTargeted();
+      } else if (event.button === 2) {
+        this.placeAtTargeted();
+      }
     });
 
     this.canvas.addEventListener('wheel', (event) => {
@@ -455,14 +571,14 @@ export class Game {
     this.toastElement = toast;
   }
 
-  private showToast(message: string) {
+  private showToast(message: string, durationMs = 1200) {
     this.toastElement.textContent = message;
     this.toastElement.style.opacity = '1';
     if (this.toastTimeoutId !== null) window.clearTimeout(this.toastTimeoutId);
     this.toastTimeoutId = window.setTimeout(() => {
       this.toastElement.style.opacity = '0';
       this.toastTimeoutId = null;
-    }, 1200);
+    }, durationMs);
   }
 
   // EXT_disjoint_timer_query_webgl2 gives us true GPU time for the render
@@ -754,6 +870,13 @@ export class Game {
       this.villagers.push(villager);
       this.worldRoot.add(villager.getGroup());
     }
+
+    // Furnish this village's houses — torches, beds, tables, doors.
+    for (const house of this.worldGenerator.getHouses(v)) {
+      const interior = new HouseInterior(house);
+      this.houseInteriors.push(interior);
+      this.worldRoot.add(interior.getGroup());
+    }
   }
 
   private updateVillagerSpawn(deltaTime: number) {
@@ -765,6 +888,296 @@ export class Game {
       playerPos.x, playerPos.z, this.VILLAGE_ACTIVATION_RADIUS,
     );
     for (const v of villages) this.activateVillage(v);
+  }
+
+  private updatePoliceStations(deltaTime: number) {
+    for (const st of this.policeStations) st.update(deltaTime, this.player.position);
+  }
+
+  // Mirrors village activation: once per second, spin up any police fortress
+  // near the player that isn't active yet, building its furniture/prisoners.
+  private updatePoliceStationSpawn(deltaTime: number) {
+    this.stationSpawnAccum += deltaTime;
+    if (this.stationSpawnAccum < 1) return;
+    this.stationSpawnAccum = 0;
+    const playerPos = this.player.position;
+    const stations = this.worldGenerator.getPoliceStationsNear(
+      playerPos.x, playerPos.z, this.VILLAGE_ACTIVATION_RADIUS,
+    );
+    for (const s of stations) {
+      if (this.activatedStationKeys.has(s.key)) continue;
+      this.activatedStationKeys.add(s.key);
+      const cells = this.worldGenerator.getPoliceStationCells(s);
+      const station = new PoliceStation(s, cells, this.policeStationCtx);
+      this.policeStations.push(station);
+      this.worldRoot.add(station.getGroup());
+    }
+  }
+
+  // Crosshair raycast against the active stations' clickable objects (red
+  // ring, then quest figure). Returns true if a click was handled — Game then
+  // skips the mining action for this click.
+  private tryStationClick(): boolean {
+    if (this.policeStations.length === 0) return false;
+    this.clickRaycaster.set(this.player.eye, this.player.forward);
+    this.clickRaycaster.far = this.STATION_REACH;
+    let bestDist = Infinity;
+    let bestStation: PoliceStation | null = null;
+    let bestObj: THREE.Object3D | null = null;
+    for (const st of this.policeStations) {
+      const targets = st.getClickables();
+      if (targets.length === 0) continue;
+      const hits = this.clickRaycaster.intersectObjects(targets, true);
+      if (hits.length > 0 && hits[0].distance < bestDist) {
+        bestDist = hits[0].distance;
+        bestStation = st;
+        bestObj = hits[0].object;
+      }
+    }
+    if (bestStation && bestObj) {
+      bestStation.handleClick(bestObj);
+      return true;
+    }
+    return false;
+  }
+
+  // Drives house torches off the day/night cycle and shows the "sleep"
+  // prompt whenever the player is standing next to a bed.
+  private updateHouseInteriors(deltaTime: number) {
+    const nightFactor = this.skySystem.getNightFactor();
+    const playerPos = this.player.position;
+    let nearBed = false;
+    for (const h of this.houseInteriors) {
+      h.update(deltaTime, nightFactor);
+      const b = h.getBedPosition();
+      if (Math.hypot(b.x - playerPos.x, b.z - playerPos.z) < 2.6) nearBed = true;
+    }
+    this.bedPromptElement.style.opacity = nearBed && !this.sleeping ? '1' : '0';
+  }
+
+  // Crosshair raycast against house doors and beds. Doors toggle in place;
+  // a bed click starts the sleep transition. Returns true if handled.
+  private tryHouseClick(): boolean {
+    if (this.houseInteriors.length === 0) return false;
+    this.clickRaycaster.set(this.player.eye, this.player.forward);
+    this.clickRaycaster.far = this.STATION_REACH;
+    let bestDist = Infinity;
+    let bestHouse: HouseInterior | null = null;
+    let bestObj: THREE.Object3D | null = null;
+    for (const h of this.houseInteriors) {
+      const hits = this.clickRaycaster.intersectObjects(h.getClickables(), true);
+      if (hits.length > 0 && hits[0].distance < bestDist) {
+        bestDist = hits[0].distance;
+        bestHouse = h;
+        bestObj = hits[0].object;
+      }
+    }
+    if (!bestHouse || !bestObj) return false;
+    // Require line of sight: if a solid block sits between the player and the
+    // door/bed, this was really an attempt to mine that block.
+    if (this.worldGenerator.raycastBlock(this.player.eye, this.player.forward, bestDist - 0.05)) {
+      return false;
+    }
+    const action = bestHouse.handleClick(bestObj);
+    if (action === 'sleep') this.startSleep(bestHouse.getBedPosition());
+    return action !== null;
+  }
+
+  // Sleep transition: the player lies down on the bed (camera drops to the
+  // mattress and looks up), the screen fades through black while the clock
+  // jumps to morning, then the player gets back up where they stood.
+  private startSleep(bedPos: THREE.Vector3) {
+    if (this.sleeping) return;
+    this.sleeping = true;
+    this.bedPromptElement.style.opacity = '0';
+    this.sfx.play('pickup');
+
+    // Head resting near the pillow end, eye just above the mattress, facing up.
+    const lyingPos = new THREE.Vector3(bedPos.x - 0.45, bedPos.y + 0.62, bedPos.z);
+    const lyingPitch = 1.25;
+    // Standing pose to return to — exactly where the player was when they clicked.
+    const standPos = this.player.eye.clone();
+    const standPitch = this.player.pitch;
+    const standYaw = this.player.yaw;
+
+    this.camera.rotation.order = 'YXZ';
+
+    gsap.timeline({ onComplete: () => { this.sleeping = false; } })
+      // Lie down onto the bed.
+      .to(this.camera.position, {
+        x: lyingPos.x, y: lyingPos.y, z: lyingPos.z, duration: 0.45, ease: 'power2.inOut',
+      }, 0)
+      .to(this.camera.rotation, { x: lyingPitch, duration: 0.45, ease: 'power2.inOut' }, 0)
+      // Fade through black, jump the clock to morning (auto-extinguishes torches).
+      .to(this.sleepOverlay, { opacity: 1, duration: 0.5, ease: 'power2.in' })
+      .add(() => { this.skySystem.setTimeOfDay(0.28); })
+      .to(this.sleepOverlay, { opacity: 0, duration: 0.7, ease: 'power2.out' }, '+=0.35')
+      // Get back up.
+      .to(this.camera.position, {
+        x: standPos.x, y: standPos.y, z: standPos.z, duration: 0.4, ease: 'power2.inOut',
+      })
+      .to(this.camera.rotation, { x: standPitch, y: standYaw, duration: 0.4, ease: 'power2.inOut' }, '<');
+  }
+
+  // --- Companion command input (a=meat, b=wood, c=stone) ---
+
+  private openCommandMode(): void {
+    this.commandMode = true;
+    this.commandBuffer = '';
+    // Drop any held movement keys so the player doesn't keep walking.
+    this.keyStates = {};
+    this.commandBoxElement.style.display = 'block';
+    this.refreshCommandBox();
+  }
+
+  private closeCommandMode(): void {
+    this.commandMode = false;
+    this.commandBuffer = '';
+    this.commandBoxElement.style.display = 'none';
+  }
+
+  private refreshCommandBox(): void {
+    this.commandBoxElement.textContent =
+      `> ${this.commandBuffer}_   (a=meat  b=wood  c=stone)`;
+  }
+
+  private handleCommandKey(event: KeyboardEvent): void {
+    if (event.code === 'Escape') { this.closeCommandMode(); return; }
+    if (event.code === 'Enter') { this.submitCommand(); return; }
+    if (event.code === 'Backspace') {
+      this.commandBuffer = this.commandBuffer.slice(0, -1);
+      this.refreshCommandBox();
+      return;
+    }
+    // event.key holds the typed character; only accept printables.
+    if (event.key.length === 1 && this.commandBuffer.length < 12) {
+      this.commandBuffer += event.key.toLowerCase();
+      this.refreshCommandBox();
+    }
+  }
+
+  private submitCommand(): void {
+    const raw = this.commandBuffer.trim().toLowerCase();
+    this.closeCommandMode();
+    if (!raw) return;
+    const ch = raw[0];
+    const type: GatherType | null =
+      ch === 'a' ? 'meat' : ch === 'b' ? 'wood' : ch === 'c' ? 'stone' : null;
+    if (!type) {
+      this.showToast(`Unknown command: ${raw}`, 1800);
+      return;
+    }
+    if (this.companion) this.companion.command(type);
+  }
+
+  // --- Companion context implementation (findTarget / harvest / deliver) ---
+
+  private findCompanionTarget(type: GatherType, from: THREE.Vector3): THREE.Vector3 | null {
+    if (type === 'meat') {
+      let best: THREE.Vector3 | null = null;
+      let bestDist = 50;
+      for (const a of this.animals) {
+        if (!a.isAlive()) continue;
+        const p = a.getPosition();
+        const d = Math.hypot(p.x - from.x, p.z - from.z);
+        if (d < bestDist) { bestDist = d; best = p; }
+      }
+      return best ? new THREE.Vector3(best.x, best.y, best.z) : null;
+    }
+    if (type === 'wood') {
+      // Ring scan outward for a tree trunk WOOD block on the surface.
+      const cx = Math.floor(from.x);
+      const cz = Math.floor(from.z);
+      for (let r = 1; r <= 28; r++) {
+        for (let dx = -r; dx <= r; dx++) {
+          for (let dz = -r; dz <= r; dz++) {
+            if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+            const wx = cx + dx;
+            const wz = cz + dz;
+            const gy = this.worldGenerator.getHeightAt(wx, wz);
+            if (gy <= 0) continue;
+            if (this.isTreeTrunk(wx, gy, wz)) {
+              return new THREE.Vector3(wx + 0.5, gy, wz + 0.5);
+            }
+          }
+        }
+      }
+      return null;
+    }
+    // stone: dig a hole a few blocks away from the companion.
+    const sx = from.x + 5;
+    const sz = from.z;
+    const gy = this.worldGenerator.getHeightAt(sx, sz);
+    return new THREE.Vector3(sx, gy, sz);
+  }
+
+  // A tree is a WOOD column capped by LEAVES. House walls are also WOOD but
+  // end in ROOF (or air), so this keeps the companion from chopping houses.
+  private isTreeTrunk(wx: number, baseY: number, wz: number): boolean {
+    if (this.worldGenerator.getBlock(wx, baseY, wz) !== WOOD) return false;
+    let y = baseY + 1;
+    while (y < baseY + 8 && this.worldGenerator.getBlock(wx, y, wz) === WOOD) y++;
+    return this.worldGenerator.getBlock(wx, y, wz) === LEAVES;
+  }
+
+  private harvestForCompanion(type: GatherType, at: THREE.Vector3): CarryLoad | null {
+    if (type === 'meat') {
+      let nearest: Animal | null = null;
+      let bestDist = 8;
+      for (const a of this.animals) {
+        if (!a.isAlive()) continue;
+        const p = a.getPosition();
+        const d = Math.hypot(p.x - at.x, p.z - at.z);
+        if (d < bestDist) { bestDist = d; nearest = a; }
+      }
+      if (!nearest) return null;
+      nearest.destroy();
+      return { kind: 'meat', count: 1 };
+    }
+    if (type === 'wood') {
+      // Chop up to 6 WOOD blocks in the column starting at `at.y`.
+      const wx = Math.floor(at.x);
+      const wz = Math.floor(at.z);
+      const startY = Math.floor(at.y);
+      let count = 0;
+      for (let y = startY; y < startY + 8 && count < 6; y++) {
+        if (this.worldGenerator.getBlock(wx, y, wz) === WOOD) {
+          this.worldGenerator.placeBlock(wx, y, wz, AIR);
+          count++;
+        } else if (count > 0) {
+          break;
+        }
+      }
+      return count === 0 ? null : { kind: 'blocks', entries: [[WOOD, count]] };
+    }
+    // stone: dig down through the surface, collecting whatever lies below.
+    const wx = Math.floor(at.x);
+    const wz = Math.floor(at.z);
+    const gy = this.worldGenerator.getHeightAt(wx, wz);
+    const tally = new Map<BlockId, number>();
+    for (let y = gy - 1; y >= Math.max(1, gy - 8); y--) {
+      const b = this.worldGenerator.getBlock(wx, y, wz);
+      if (b !== DIRT && b !== STONE && b !== GRASS && b !== SAND
+        && b !== COAL_ORE && b !== IRON_ORE && b !== GOLD_ORE) continue;
+      this.worldGenerator.placeBlock(wx, y, wz, AIR);
+      tally.set(b, (tally.get(b) ?? 0) + 1);
+    }
+    if (tally.size === 0) return null;
+    return { kind: 'blocks', entries: [...tally] };
+  }
+
+  private deliverFromCompanion(load: CarryLoad): string {
+    if (load.kind === 'meat') {
+      this.inventory.addFood(load.count);
+      return `Companion: +${load.count} Meat`;
+    }
+    const parts: string[] = [];
+    for (const [block, count] of load.entries) {
+      if (count <= 0) continue;
+      this.inventory.addBlock(block, count);
+      parts.push(`+${count} ${blockLabel(block)}`);
+    }
+    return parts.length > 0 ? `Companion: ${parts.join(', ')}` : `Companion: nothing to deliver.`;
   }
 
   private setupEconomyHud(container: HTMLElement) {
@@ -1131,13 +1544,17 @@ export class Game {
 
     this.updateTitle();
 
-    this.player.update(deltaTime, this.gatherInput(),
-      (wx, wy, wz) => this.worldGenerator.getBlock(wx, wy, wz) !== AIR);
+    // While sleeping the player is frozen and the camera pose is driven by
+    // the sleep tween instead of the normal eye sync.
+    if (!this.sleeping) {
+      this.player.update(deltaTime, this.gatherInput(),
+        (wx, wy, wz) => this.worldGenerator.getBlock(wx, wy, wz) !== AIR);
 
-    if (this.player.didJump) this.sfx.play('jump');
-    this.wasGrounded = this.player.grounded;
+      if (this.player.didJump) this.sfx.play('jump');
+      this.wasGrounded = this.player.grounded;
 
-    this.updateCamera();
+      this.updateCamera();
+    }
     this.skySystem.advance(deltaTime);
     this.skySystem.updateForCamera(this.camera);
     this.grassSystem.update(deltaTime);
@@ -1165,6 +1582,10 @@ export class Game {
     this.updateAnimals(deltaTime);
     this.updateVillagers(deltaTime);
     this.updateVillagerSpawn(deltaTime);
+    this.updatePoliceStations(deltaTime);
+    this.updatePoliceStationSpawn(deltaTime);
+    this.updateHouseInteriors(deltaTime);
+    this.companion?.update(deltaTime);
 
     this.drawMinimap();
     this.updateEconomyHud();
@@ -1288,6 +1709,8 @@ export class Game {
     if (!selected) { this.viewModel.setKind('none'); return; }
     if (selected.item.kind === 'tool') {
       this.viewModel.setKind(selected.item.tool);
+    } else if (selected.item.kind === 'food') {
+      this.viewModel.setKind('none');
     } else {
       this.viewModel.setKind('block', selected.item.block);
     }

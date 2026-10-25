@@ -1,5 +1,5 @@
 import type { BlockId } from './BlockTypes';
-import { AIR, LEAVES, ROOF, WATER, WOOD } from './BlockTypes';
+import { AIR, BARBED_WIRE, BARS, LEAVES, POLICE, ROOF, WATER, WOOD } from './BlockTypes';
 
 // Face bit indices used by the flood-fill connectivity matrix.
 export const FACE_PX = 0;
@@ -165,7 +165,7 @@ export class VoxelChunk {
         let top = 0;
         for (let y = this.sizeY - 1; y >= 0; y--) {
           const block = this.voxels[this.idx(x, y, z)];
-          if (block !== AIR && block !== WOOD && block !== LEAVES && block !== ROOF) {
+          if (block !== AIR && block !== WOOD && block !== LEAVES && block !== ROOF && block !== POLICE && block !== BARS && block !== BARBED_WIRE) {
             top = y + 1;
             break;
           }

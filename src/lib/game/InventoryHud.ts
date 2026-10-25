@@ -85,6 +85,10 @@ export class InventoryHud {
       if (slot.item.kind === 'tool') {
         iconBox.style.background = slot.item.tool === 'pickaxe' ? '#5b6775' : '#7a5a2e';
         iconBox.textContent = slot.item.tool === 'pickaxe' ? 'PICK' : 'AXE';
+      } else if (slot.item.kind === 'food') {
+        iconBox.style.background = '#a83f2a';
+        iconBox.textContent = 'MEAT';
+        iconBox.title = 'Meat';
       } else {
         const tex = BLOCK_TEXTURES[slot.item.block];
         const layer = tex ? tex.side : 0;
@@ -120,6 +124,7 @@ export class InventoryHud {
       const s = this.inventory.getSlot(i);
       if (!s) { parts.push('-'); continue; }
       if (s.item.kind === 'tool') parts.push(`t:${s.item.tool}`);
+      else if (s.item.kind === 'food') parts.push(`f:${s.count}`);
       else parts.push(`b:${s.item.block}x${s.count}`);
     }
     return parts.join('|');

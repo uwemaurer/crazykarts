@@ -1,8 +1,11 @@
 import type { BlockId } from './voxel/BlockTypes';
-import { COAL_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES, ROAD, ROOF, SAND, SNOW, STONE, WOOD } from './voxel/BlockTypes';
+import { BARBED_WIRE, BARS, COAL_ORE, DIRT, GOLD_ORE, GRASS, IRON_ORE, LEAVES, POLICE, ROAD, ROOF, SAND, SNOW, STONE, WOOD } from './voxel/BlockTypes';
 
 export type ToolKind = 'pickaxe' | 'axe';
-export type ItemKind = { kind: 'tool'; tool: ToolKind } | { kind: 'block'; block: BlockId };
+export type ItemKind =
+  | { kind: 'tool'; tool: ToolKind }
+  | { kind: 'block'; block: BlockId }
+  | { kind: 'food' }; // meat brought back by the companion
 
 export interface Slot {
   item: ItemKind;
@@ -14,6 +17,7 @@ export interface SerializedInventory {
   slots: Array<
     | { kind: 'tool'; tool: ToolKind; count: number }
     | { kind: 'block'; block: BlockId; count: number }
+    | { kind: 'food'; count: number }
     | null
   >;
 }
@@ -34,6 +38,9 @@ const BLOCK_COLORS: Record<BlockId, string> = {
   [COAL_ORE]: '#2a2a2e',
   [IRON_ORE]: '#a87a4a',
   [GOLD_ORE]: '#f0c640',
+  [POLICE]:   '#2f44a0',
+  [BARS]:     '#8a8f9c',
+  [BARBED_WIRE]: '#6f7178',
 };
 
 const BLOCK_LABELS: Record<BlockId, string> = {
@@ -49,6 +56,9 @@ const BLOCK_LABELS: Record<BlockId, string> = {
   [COAL_ORE]: 'Coal Ore',
   [IRON_ORE]: 'Iron Ore',
   [GOLD_ORE]: 'Gold Ore',
+  [POLICE]:   'Police Block',
+  [BARS]:     'Cell Bars',
+  [BARBED_WIRE]: 'Barbed Wire',
 };
 
 export function blockColor(block: BlockId): string {
@@ -113,6 +123,33 @@ export class Inventory {
     return count - remaining;
   }
 
+  // Meat from the companion. Stacks like blocks but has no block id.
+  public addFood(count = 1): number {
+    let remaining = count;
+    for (let i = 0; i < SLOT_COUNT && remaining > 0; i++) {
+      const s = this.slots[i];
+      if (!s || s.item.kind !== 'food') continue;
+      const canAdd = Math.min(remaining, STACK_MAX - s.count);
+      s.count += canAdd;
+      remaining -= canAdd;
+    }
+    for (let i = 0; i < SLOT_COUNT && remaining > 0; i++) {
+      if (this.slots[i]) continue;
+      const take = Math.min(remaining, STACK_MAX);
+      this.slots[i] = { item: { kind: 'food' }, count: take };
+      remaining -= take;
+    }
+    return count - remaining;
+  }
+
+  public countFood(): number {
+    let total = 0;
+    for (const s of this.slots) {
+      if (s && s.item.kind === 'food') total += s.count;
+    }
+    return total;
+  }
+
   public consumeSelectedBlock(): BlockId | null {
     const s = this.slots[this.selected];
     if (!s || s.item.kind !== 'block') return null;
@@ -140,6 +177,30 @@ export class Inventory {
     return false;
   }
 
+  public countBlock(block: BlockId): number {
+    let total = 0;
+    for (const s of this.slots) {
+      if (s && s.item.kind === 'block' && s.item.block === block) total += s.count;
+    }
+    return total;
+  }
+
+  // Removes `count` of `block` across stacks. Returns false (and removes
+  // nothing) if the inventory doesn't hold that many.
+  public consumeBlocks(block: BlockId, count: number): boolean {
+    if (this.countBlock(block) < count) return false;
+    let remaining = count;
+    for (let i = 0; i < SLOT_COUNT && remaining > 0; i++) {
+      const s = this.slots[i];
+      if (!s || s.item.kind !== 'block' || s.item.block !== block) continue;
+      const take = Math.min(remaining, s.count);
+      s.count -= take;
+      remaining -= take;
+      if (s.count <= 0) this.slots[i] = null;
+    }
+    return true;
+  }
+
   public serialize(): SerializedInventory {
     return {
       selected: this.selected,
@@ -147,6 +208,9 @@ export class Inventory {
         if (!s) return null;
         if (s.item.kind === 'tool') {
           return { kind: 'tool', tool: s.item.tool, count: s.count };
+        }
+        if (s.item.kind === 'food') {
+          return { kind: 'food', count: s.count };
         }
         return { kind: 'block', block: s.item.block, count: s.count };
       }),
@@ -161,6 +225,8 @@ export class Inventory {
       if (!s) continue;
       if (s.kind === 'tool') {
         this.slots[i] = { item: { kind: 'tool', tool: s.tool }, count: s.count };
+      } else if (s.kind === 'food') {
+        this.slots[i] = { item: { kind: 'food' }, count: s.count };
       } else {
         this.slots[i] = { item: { kind: 'block', block: s.block }, count: s.count };
       }

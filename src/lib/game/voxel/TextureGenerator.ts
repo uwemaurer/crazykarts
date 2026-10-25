@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { createNoise4D } from 'simplex-noise';
 import {
+  TEX_BARBED_WIRE,
+  TEX_BARS,
   TEX_COAL_ORE,
   TEX_DIRT,
   TEX_GOLD_ORE,
@@ -10,6 +12,7 @@ import {
   TEX_LEAVES,
   TEX_MOSS_GRASS_SIDE,
   TEX_MOSS_GRASS_TOP,
+  TEX_POLICE,
   TEX_ROAD,
   TEX_ROOF,
   TEX_SAND,
@@ -294,6 +297,83 @@ function generateRoof(data: Uint8Array) {
   }
 }
 
+// Police station block: police-blue masonry with a faint block grid and a
+// white diamond badge (with a blue pip) in the tile centre. One tile, all
+// six faces — the station's walls, flat roof and beacon all use it.
+function generatePolice(data: Uint8Array) {
+  const cx = 7.5;
+  const cy = 7.5;
+  for (let y = 0; y < TILE_SIZE; y++) {
+    for (let x = 0; x < TILE_SIZE; x++) {
+      const n = hash(x, y, 1901);
+      const grid = x % 8 === 0 || y % 8 === 0 ? 0.80 : 1.0;
+      const shade = (0.90 + n * 0.18) * grid;
+      let r = 0.16 * shade;
+      let g = 0.24 * shade;
+      let b = 0.58 * shade;
+      const dia = Math.abs(x - cx) + Math.abs(y - cy);
+      if (dia <= 4.5) {
+        const w = 0.92 + n * 0.12;
+        r = 0.95 * w;
+        g = 0.96 * w;
+        b = 0.98 * w;
+        if (dia <= 1.5) { r = 0.18; g = 0.30; b = 0.70; }
+      }
+      setPixel(data, TEX_POLICE, x, y, r, g, b);
+    }
+  }
+}
+
+// Cell bars: dark steel interior with bright vertical bars and a couple of
+// horizontal cross-rails. One tile, all six faces — used for the front of
+// every jail cell in the fortress.
+function generateBars(data: Uint8Array) {
+  for (let y = 0; y < TILE_SIZE; y++) {
+    for (let x = 0; x < TILE_SIZE; x++) {
+      const n = hash(x, y, 2201);
+      // Dark gap behind the bars.
+      let r = 0.10 * (0.8 + n * 0.4);
+      let g = 0.10 * (0.8 + n * 0.4);
+      let b = 0.12 * (0.8 + n * 0.4);
+      const onBar = x % 5 === 1 || x % 5 === 2;
+      const onRail = y === 2 || y === 13;
+      if (onBar || onRail) {
+        const s = 0.62 + n * 0.35;
+        r = 0.58 * s;
+        g = 0.60 * s;
+        b = 0.66 * s;
+      }
+      setPixel(data, TEX_BARS, x, y, r, g, b);
+    }
+  }
+}
+
+// Barbed wire: a dark base crossed by two diagonal wire strands with the odd
+// bright barb. Sits as a single layer on top of the outer battlements.
+function generateBarbedWire(data: Uint8Array) {
+  for (let y = 0; y < TILE_SIZE; y++) {
+    for (let x = 0; x < TILE_SIZE; x++) {
+      const n = hash(x, y, 2301);
+      let r = 0.09 * (0.8 + n * 0.5);
+      let g = 0.10 * (0.8 + n * 0.5);
+      let b = 0.11 * (0.8 + n * 0.5);
+      const strandA = (x + y) % 6 < 1;
+      const strandB = (x - y + TILE_SIZE) % 6 < 1;
+      if (strandA || strandB) {
+        const s = 0.55 + n * 0.4;
+        r = 0.52 * s;
+        g = 0.52 * s;
+        b = 0.55 * s;
+      }
+      // Barbs: bright specks where the two strands nearly cross.
+      if (strandA && strandB || hash(x, y, 2302) > 0.95) {
+        r = 0.85; g = 0.85; b = 0.9;
+      }
+      setPixel(data, TEX_BARBED_WIRE, x, y, r, g, b);
+    }
+  }
+}
+
 let cachedBlockData: Uint8Array | null = null;
 
 function getBlockData(): Uint8Array {
@@ -318,6 +398,9 @@ function getBlockData(): Uint8Array {
     generateCoalOre(data);
     generateIronOre(data);
     generateGoldOre(data);
+    generatePolice(data);
+    generateBars(data);
+    generateBarbedWire(data);
     cachedBlockData = data;
   }
   return cachedBlockData;
