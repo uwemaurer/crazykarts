@@ -150,6 +150,11 @@ export class Inventory {
     return total;
   }
 
+  public canAddBlock(block: BlockId): boolean {
+    return this.slots.some(s =>
+      !s || (s.item.kind === 'block' && s.item.block === block && s.count < STACK_MAX));
+  }
+
   public consumeSelectedBlock(): BlockId | null {
     const s = this.slots[this.selected];
     if (!s || s.item.kind !== 'block') return null;

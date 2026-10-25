@@ -516,6 +516,12 @@ export class Game {
     window.addEventListener('keyup', (event) => {
       this.keyStates[event.code] = false;
     });
+    // Keyup never arrives if focus leaves mid-press (alt-tab), so drop all held keys.
+    const releaseAllKeys = () => { this.keyStates = {}; };
+    window.addEventListener('blur', releaseAllKeys);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) releaseAllKeys();
+    });
 
     // Pointer lock on click.
     this.canvas.addEventListener('click', () => {
@@ -809,8 +815,10 @@ export class Game {
       : this.worldGenerator.getPendingConstructionBlocks(v);
     this.villageConstructionQueues.set(key, pending);
 
+    // Builders wait (and retry) while the player stands in the spot.
     const placeBlock = (b: PlanBlock): boolean =>
-      this.worldGenerator.placeBlock(b.wx, b.wy, b.wz, b.block);
+      !this.blockIntersectsPlayer(b.wx, b.wy, b.wz)
+      && this.worldGenerator.placeBlock(b.wx, b.wy, b.wz, b.block);
 
     const getWorkSpot = (prof: Profession): THREE.Vector3 => {
       const r = 20 + Math.random() * 10;
@@ -1547,8 +1555,9 @@ export class Game {
     // While sleeping the player is frozen and the camera pose is driven by
     // the sleep tween instead of the normal eye sync.
     if (!this.sleeping) {
+      // Below y=0 counts as solid so the player can never fall out of the world.
       this.player.update(deltaTime, this.gatherInput(),
-        (wx, wy, wz) => this.worldGenerator.getBlock(wx, wy, wz) !== AIR);
+        (wx, wy, wz) => wy < 0 || this.worldGenerator.getBlock(wx, wy, wz) !== AIR);
 
       if (this.player.didJump) this.sfx.play('jump');
       this.wasGrounded = this.player.grounded;
@@ -1744,6 +1753,7 @@ export class Game {
     // bottom of the world. No SFX or inventory update either — the click
     // silently no-ops, mirroring how Minecraft handles bedrock.
     if (wy === 0) return;
+    if (!this.inventory.canAddBlock(block)) { this.flashHint('Inventory full'); return; }
     const ok = this.worldGenerator.placeBlock(wx, wy, wz, AIR);
     if (!ok) return;
     this.inventory.addBlock(block, 1);
@@ -1818,11 +1828,11 @@ export class Game {
 
     const finalize = () => {
       const stillAir = this.worldGenerator.getBlock(wx, wy, wz) === AIR;
-      if (stillAir) {
+      if (stillAir && !this.blockIntersectsPlayer(wx, wy, wz)) {
         this.worldGenerator.placeBlock(wx, wy, wz, block);
         this.invalidateGrassAround(wx, wz);
       } else {
-        // Target got filled by something else (villager); give the block back.
+        // Target got filled (e.g. by a villager) or the player walked into it; give the block back.
         this.inventory.addBlock(block, 1);
       }
       this.worldRoot.remove(mesh);
@@ -1910,6 +1920,7 @@ export class Game {
       return;
     }
     const b = queue[pickedIndex];
+    if (this.blockIntersectsPlayer(b.wx, b.wy, b.wz)) { this.flashHint('Step out of the way'); return; }
     if (!this.inventory.consumeBlock(b.block)) return;
     const ok = this.worldGenerator.placeBlock(b.wx, b.wy, b.wz, b.block);
     if (!ok) { this.inventory.addBlock(b.block, 1); return; }

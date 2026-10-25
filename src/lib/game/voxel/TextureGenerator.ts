@@ -782,7 +782,9 @@ if (isGrassTop || isMossTop) {
   // tile seams (fract() jumps 0.99→0.01 at a boundary otherwise).
   vec2 dx = dFdx(vTileUv);
   vec2 dy = dFdy(vTileUv);
-  albedo = textureGrad(tAtlas, vec3(fract(vTileUv), vLayer), dx, dy).rgb;
+  // Texture row 0 is the top of a tile, but face v grows upward, so flip v.
+  vec2 tileUv = vec2(fract(vTileUv.x), 1.0 - fract(vTileUv.y));
+  albedo = textureGrad(tAtlas, vec3(tileUv, vLayer), dx, dy).rgb;
 }
 diffuseColor.rgb *= albedo;
 // Sky-occlusion shading. Three levels distinguish where the face sits in
